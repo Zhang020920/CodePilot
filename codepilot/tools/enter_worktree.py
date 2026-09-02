@@ -35,7 +35,6 @@ class EnterWorktreeTool(Tool):
     )
     params_model = EnterWorktreeParams
     category = "command"
-    should_defer = True
 
 
     def __init__(self, worktree_manager: WorktreeManager) -> None:

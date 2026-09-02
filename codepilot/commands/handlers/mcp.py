@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 from mewcode.commands.registry import Command, CommandContext, CommandType
+from mewcode.mcp.tool_wrapper import mcp_tool_name_prefix
 
 
 async def handle_mcp(ctx: CommandContext) -> None:
@@ -21,13 +22,14 @@ async def handle_mcp(ctx: CommandContext) -> None:
     mcp_mgr = getattr(app, "mcp_manager", None)
     if mcp_mgr and hasattr(mcp_mgr, "_clients"):
         for name, client in mcp_mgr._clients.items():
+            prefix = mcp_tool_name_prefix(name)
             tool_names = [
                 t.name for t in ctx.agent.registry.list_tools()
-                if t.name.startswith(f"mcp__{name}__")
+                if t.name.startswith(prefix)
             ]
             lines.append(f"\n  {name}: {len(tool_names)} tools")
             for tn in tool_names[:10]:
-                short = tn.replace(f"mcp__{name}__", "")
+                short = tn[len(prefix):]
                 lines.append(f"    - {short}")
             if len(tool_names) > 10:
                 lines.append(f"    … and {len(tool_names) - 10} more")

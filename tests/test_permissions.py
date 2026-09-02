@@ -125,6 +125,20 @@ class TestPathSandbox:
         assert not ok
         assert "沙箱" in reason
 
+    def test_deny_write_paths(self) -> None:
+        """受保护路径独立可查，供 bypass 模式下的前置判定使用"""
+        for rel in (
+            ".mewcode/permissions.local.yaml",
+            ".mewcode/config.yaml",
+            ".mewcode/skills/evil/SKILL.md",
+        ):
+            ok, reason = self.sandbox.check_deny_write(str(self.tmpdir / rel))
+            assert not ok, f"{rel} 应命中禁写列表"
+            assert "禁写" in reason
+
+        ok, _ = self.sandbox.check_deny_write(str(self.tmpdir / "a.txt"))
+        assert ok
+
     def test_home_ssh(self) -> None:
         ok, _ = self.sandbox.check("~/.ssh/id_rsa")
         assert not ok
@@ -211,28 +225,110 @@ class TestRuleEngine:
         assert engine.evaluate("Bash", "rm -rf build") == "deny"
         assert engine.evaluate("Bash", "npm test") is None
 
-    def test_same_tier_last_wins(self) -> None:
+    def test_deny_beats_allow_in_same_file(self) -> None:
+        """同一文件内的书写顺序不参与裁决，两种顺序都判 deny"""
+        for effects in (["deny", "allow"], ["allow", "deny"]):
+            tmpdir = Path(tempfile.mkdtemp())
+            rules_file = tmpdir / "rules.yaml"
+            rules_file.write_text(yaml.dump([
+                {"rule": "Bash(git *)", "effect": effects[0]},
+                {"rule": "Bash(git *)", "effect": effects[1]},
+            ]))
+            engine = RuleEngine(project_rules_path=rules_file)
+            assert engine.evaluate("Bash", "git status") == "deny"
+
+    def test_deny_beats_allow_across_files(self) -> None:
+        """deny 写在哪一层都压过其他层的 allow"""
+        for deny_tier in ("user", "project", "local"):
+            tmpdir = Path(tempfile.mkdtemp())
+            paths = {t: tmpdir / f"{t}.yaml" for t in ("user", "project", "local")}
+            for tier, path in paths.items():
+                effect = "deny" if tier == deny_tier else "allow"
+                path.write_text(yaml.dump([{"rule": "Bash(rm *)", "effect": effect}]))
+            engine = RuleEngine(
+                user_rules_path=paths["user"],
+                project_rules_path=paths["project"],
+                local_rules_path=paths["local"],
+            )
+            assert engine.evaluate("Bash", "rm -rf build/") == "deny"
+
+    def test_reuses_parsed_rules(self) -> None:
+        """文件没变动时复用上次的解析结果，不重复读盘"""
+        import os as _os
+
+        allow_rule = '- rule: "Bash(git *)"\n  effect: allow\n'
+        # 与 allow_rule 等长，用尾随空格补齐，YAML 解析时会被忽略
+        deny_rule_same_size = '- rule: "Bash(git *)"\n  effect: deny \n'
+        assert len(allow_rule) == len(deny_rule_same_size)
+
         tmpdir = Path(tempfile.mkdtemp())
         rules_file = tmpdir / "rules.yaml"
-        rules_file.write_text(yaml.dump([
-            {"rule": "Bash(git *)", "effect": "deny"},
-            {"rule": "Bash(git *)", "effect": "allow"},
-        ]))
+        rules_file.write_text(allow_rule)
         engine = RuleEngine(project_rules_path=rules_file)
-        assert engine.evaluate("Bash", "git status") == "allow"
+        assert engine.evaluate("Bash", "git push") == "allow"
 
-    def test_higher_tier_wins(self) -> None:
+        # 偷偷把内容换成 deny，同时把 size 和 mtime 都还原成原样：
+        # 引擎看不出文件动过，应当继续用缓存里的解析结果
+        st = rules_file.stat()
+        rules_file.write_text(deny_rule_same_size)
+        _os.utime(rules_file, ns=(st.st_atime_ns, st.st_mtime_ns))
+
+        assert engine.evaluate("Bash", "git push") == "allow"
+
+    def test_detects_same_size_edit(self) -> None:
+        """长度相同但内容变了，只要修改时间前进就要重新解析"""
+        import os as _os
+        import time as _time
+
+        tmpdir = Path(tempfile.mkdtemp())
+        rules_file = tmpdir / "rules.yaml"
+        rules_file.write_text('- rule: "Bash(git *)"\n  effect: allow\n')
+        engine = RuleEngine(project_rules_path=rules_file)
+        assert engine.evaluate("Bash", "git push") == "allow"
+
+        rules_file.write_text('- rule: "Bash(git *)"\n  effect: deny \n')
+        # 把修改时间显式前移，模拟秒级时间戳文件系统上的一次真实改动
+        future = _time.time() + 2
+        _os.utime(rules_file, (future, future))
+
+        assert engine.evaluate("Bash", "git push") == "deny"
+
+    def test_drops_cache_when_file_removed(self) -> None:
+        """规则文件消失后按空规则处理，不残留上一次的缓存"""
+        tmpdir = Path(tempfile.mkdtemp())
+        rules_file = tmpdir / "rules.yaml"
+        rules_file.write_text('- rule: "Bash(git *)"\n  effect: deny\n')
+        engine = RuleEngine(project_rules_path=rules_file)
+        assert engine.evaluate("Bash", "git push") == "deny"
+
+        rules_file.unlink()
+        assert engine.evaluate("Bash", "git push") is None
+
+    def test_picks_up_file_changes(self) -> None:
+        """改完规则文件无需重建引擎即刻生效"""
+        tmpdir = Path(tempfile.mkdtemp())
+        rules_file = tmpdir / "rules.yaml"
+        rules_file.write_text(yaml.dump([{"rule": "Bash(git *)", "effect": "allow"}]))
+        engine = RuleEngine(project_rules_path=rules_file)
+        assert engine.evaluate("Bash", "git push") == "allow"
+
+        # 同一个引擎实例，改完文件后立即反映新规则
+        rules_file.write_text(yaml.dump([{"rule": "Bash(git *)", "effect": "deny"}]))
+        assert engine.evaluate("Bash", "git push") == "deny"
+
+    def test_ask_priority(self) -> None:
+        """ask 压过 allow，但压不过 deny"""
         tmpdir = Path(tempfile.mkdtemp())
         user_file = tmpdir / "user.yaml"
-        project_file = tmpdir / "project.yaml"
-        user_file.write_text(yaml.dump([
-            {"rule": "Bash(rm *)", "effect": "deny"},
-        ]))
-        project_file.write_text(yaml.dump([
-            {"rule": "Bash(rm *)", "effect": "allow"},
-        ]))
-        engine = RuleEngine(user_rules_path=user_file, project_rules_path=project_file)
-        assert engine.evaluate("Bash", "rm -rf build/") == "deny"
+        local_file = tmpdir / "local.yaml"
+        local_file.write_text(yaml.dump([{"rule": "Bash(git *)", "effect": "ask"}]))
+
+        user_file.write_text(yaml.dump([{"rule": "Bash(git *)", "effect": "allow"}]))
+        engine = RuleEngine(user_rules_path=user_file, local_rules_path=local_file)
+        assert engine.evaluate("Bash", "git status") == "ask"
+
+        user_file.write_text(yaml.dump([{"rule": "Bash(git *)", "effect": "deny"}]))
+        assert engine.evaluate("Bash", "git status") == "deny"
 
     def test_missing_file_no_error(self) -> None:
         engine = RuleEngine(
@@ -303,6 +399,27 @@ class TestPermissionChecker:
         d = self.checker.check(tool, {"file_path": "/etc/passwd", "content": "x"})
         assert d.effect == "ask"
         assert "沙箱" in d.reason
+
+    def test_deny_write_blocked_in_bypass_mode(self) -> None:
+        """受保护路径任何模式下都不许写，bypass 也不例外"""
+        from mewcode.tools.write_file import WriteFile
+        tool = WriteFile()
+        checker = PermissionChecker(
+            detector=DangerousCommandDetector(),
+            sandbox=PathSandbox(str(self.tmpdir)),
+            rule_engine=RuleEngine(),
+            mode=PermissionMode.BYPASS,
+        )
+        for rel in (
+            ".mewcode/permissions.local.yaml",
+            ".mewcode/config.yaml",
+            ".mewcode/skills/evil/SKILL.md",
+        ):
+            d = checker.check(tool, {"file_path": str(self.tmpdir / rel), "content": "x"})
+            assert d.effect == "deny", f"{rel} 在 bypass 下也应拒绝，实际 {d.effect}"
+
+        d = checker.check(tool, {"file_path": str(self.tmpdir / "a.txt"), "content": "x"})
+        assert d.effect != "deny"
 
     def test_read_path_outside_sandbox_asks(self) -> None:
         from mewcode.tools.read_file import ReadFile
@@ -651,7 +768,8 @@ async def test_e2e_user_denies_operation():
     assert len(c["permission"]) == 1
     assert len(c["tool_result"]) == 1
     assert c["tool_result"][0].is_error
-    assert "拒绝" in c["tool_result"][0].output
+    out = c["tool_result"][0].output.lower()
+    assert "rejected" in out or "denied" in out or "拒绝" in c["tool_result"][0].output
     assert len(c["loop"]) == 1
     assert c["loop"][0].total_turns == 2
 

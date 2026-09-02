@@ -63,26 +63,45 @@ class PathSandbox:
         return False
 
 
-    def check(self, path: str) -> tuple[bool, str]:
+    def _resolve(self, path: str) -> tuple[Path | None, str]:
+        """把输入路径解析成真实绝对路径，解析不了时返回原因"""
         p = Path(path).expanduser()
         if not p.is_absolute():
             p = self.project_root / p
         abs_path = p.absolute()
 
         try:
-            real_path = abs_path.resolve(strict=True)
+            return abs_path.resolve(strict=True), ""
         except OSError:
             ancestor = abs_path
             while not ancestor.exists():
                 parent = ancestor.parent
                 if parent == ancestor:
-                    return False, f"无法解析路径: {path}"
+                    return None, f"无法解析路径: {path}"
                 ancestor = parent
             try:
                 resolved_ancestor = ancestor.resolve(strict=True)
             except OSError:
-                return False, f"无法解析路径: {path}"
-            real_path = resolved_ancestor / abs_path.relative_to(ancestor)
+                return None, f"无法解析路径: {path}"
+            return resolved_ancestor / abs_path.relative_to(ancestor), ""
+
+
+    def check_deny_write(self, path: str) -> tuple[bool, str]:
+        """单独检查受保护路径。这类路径存放权限配置与 Skill 定义，
+        任何权限模式下都不允许写入，调用方需要在模式判断之前调用它。
+        """
+        real_path, err = self._resolve(path)
+        if real_path is None:
+            return False, err
+        if self._is_deny_write(real_path):
+            return False, f"路径 {path} 在禁写列表中"
+        return True, ""
+
+
+    def check(self, path: str) -> tuple[bool, str]:
+        real_path, err = self._resolve(path)
+        if real_path is None:
+            return False, err
 
         # 禁写检查优先于允许检查
         if self._is_deny_write(real_path):

@@ -17,7 +17,6 @@ from mewcode.context.manager import (
     KEEP_RECENT_TOKENS,
     MIN_KEEP_MESSAGES,
     PERSISTED_TAG,
-    SINGLE_RESULT_CHAR_LIMIT,
     CompactCircuitBreaker,
     _align_keep_start_to_tool_pair,
     _compute_keep_start_index,
@@ -26,12 +25,11 @@ from mewcode.context.manager import (
     build_compact_messages,
     cleanup_tool_results,
     compute_compact_threshold,
-    create_replacement_state,
     ensure_session_dir,
     extract_summary,
+    is_spill_readback,
     make_persisted_preview,
     persist_tool_result,
-    should_auto_compact,
 )
 from mewcode.conversation import (
     _CHARS_PER_TOKEN,
@@ -83,95 +81,90 @@ class TestMakePersistedPreview:
 # ---------------------------------------------------------------------------
 
 class TestApplyToolResultBudget:
-    def test_single_oversized_persisted(self, tmp_path: Path) -> None:
-        conv = ConversationManager()
-        big_content = "x" * (SINGLE_RESULT_CHAR_LIMIT + 100)
-        conv.history.append(
-            Message(
-                role="user",
-                content="",
-                tool_results=[
-                    ToolResultBlock(
-                        tool_use_id="toolu_big",
-                        content=big_content,
-                    )
-                ],
-            )
-        )
-        state = create_replacement_state()
-
-        records = apply_tool_result_budget(conv, tmp_path, state)
-
-        # Design A：就地修改原始对话历史
-        tr = conv.history[0].tool_results[0]
-        assert tr.content.startswith(PERSISTED_TAG)
-        assert (tmp_path / "toolu_big.txt").exists()
-        assert len(records) == 1 and records[0].tool_use_id == "toolu_big"
+    def _batch(self, *sizes: int) -> list[ToolResultBlock]:
+        return [
+            ToolResultBlock(tool_use_id=f"t{i + 1}", content="x" * n)
+            for i, n in enumerate(sizes)
+        ]
 
     def test_under_limit_untouched(self, tmp_path: Path) -> None:
-        conv = ConversationManager()
-        small_content = "x" * 100
-        conv.history.append(
-            Message(
-                role="user",
-                content="",
-                tool_results=[
-                    ToolResultBlock(tool_use_id="toolu_sm", content=small_content)
-                ],
-            )
-        )
-        state = create_replacement_state()
+        batch = self._batch(40_000, 40_000)
 
-        records = apply_tool_result_budget(conv, tmp_path, state)
+        apply_tool_result_budget(batch, tmp_path)
 
-        # 未超限：内容保持不变（就地未修改）
-        tr = conv.history[0].tool_results[0]
-        assert tr.content == small_content
-        assert not (tmp_path / "toolu_sm.txt").exists()
-        assert records == []
-        assert "toolu_sm" in state.seen_ids
-        assert "toolu_sm" not in state.replacements
+        assert batch[0].content == "x" * 40_000
+        assert batch[1].content == "x" * 40_000
 
-    def test_aggregate_limit(self, tmp_path: Path) -> None:
-        conv = ConversationManager()
-        results = []
-        for i in range(5):
-            results.append(
-                ToolResultBlock(
-                    tool_use_id=f"toolu_agg_{i}",
-                    content="x" * (AGGREGATE_CHAR_LIMIT // 4),
-                )
-            )
-        conv.history.append(Message(role="user", content="", tool_results=results))
-        state = create_replacement_state()
+    def test_aggregate_spills_largest_first(self, tmp_path: Path) -> None:
+        # 5 条合计 225K+1，只需溢写最大的 t3 即可回到限额内
+        batch = self._batch(45_000, 45_000, 45_001, 45_000, 45_000)
 
-        apply_tool_result_budget(conv, tmp_path, state)
+        apply_tool_result_budget(batch, tmp_path)
 
-        # Design A：就地修改，直接检查原始 conversation
-        total = sum(len(tr.content) for tr in conv.history[0].tool_results)
+        total = sum(len(tr.content) for tr in batch)
+        assert total <= AGGREGATE_CHAR_LIMIT
+        replaced = [tr for tr in batch if tr.content.startswith(PERSISTED_TAG)]
+        assert len(replaced) == 1
+        assert batch[2].content.startswith(PERSISTED_TAG)
+        # 溢写文件保存了完整内容
+        assert (tmp_path / "t3.txt").read_text() == "x" * 45_001
+
+    def test_exempt_skipped(self, tmp_path: Path) -> None:
+        batch = self._batch(45_000, 45_000, 45_001, 45_000, 45_000)
+
+        apply_tool_result_budget(batch, tmp_path, {"t3"})
+
+        assert not batch[2].content.startswith(PERSISTED_TAG)
+        total = sum(len(tr.content) for tr in batch)
         assert total <= AGGREGATE_CHAR_LIMIT
 
-    def test_already_persisted_skipped(self, tmp_path: Path) -> None:
-        conv = ConversationManager()
-        persisted_content = f"{PERSISTED_TAG}\nalready persisted\n</persisted-output>"
-        conv.history.append(
-            Message(
-                role="user",
-                content="",
-                tool_results=[
-                    ToolResultBlock(tool_use_id="toolu_done", content=persisted_content)
-                ],
-            )
+    def test_all_exempt_accepts_overage(self, tmp_path: Path) -> None:
+        batch = self._batch(105_000, 105_000)
+
+        apply_tool_result_budget(batch, tmp_path, {"t1", "t2"})
+
+        assert batch[0].content == "x" * 105_000
+        assert batch[1].content == "x" * 105_000
+
+    def test_deterministic_output(self, tmp_path: Path) -> None:
+        batch1 = self._batch(45_000, 45_000, 45_001, 45_000, 45_000)
+        batch2 = self._batch(45_000, 45_000, 45_001, 45_000, 45_000)
+
+        apply_tool_result_budget(batch1, tmp_path)
+        apply_tool_result_budget(batch2, tmp_path)
+
+        for a, b in zip(batch1, batch2):
+            assert a.content == b.content
+
+    def test_idempotent_on_processed_batch(self, tmp_path: Path) -> None:
+        batch = self._batch(45_000, 45_000, 45_001, 45_000, 45_000)
+        apply_tool_result_budget(batch, tmp_path)
+        snapshot = [tr.content for tr in batch]
+
+        apply_tool_result_budget(batch, tmp_path)
+
+        assert [tr.content for tr in batch] == snapshot
+
+# ---------------------------------------------------------------------------
+# is_spill_readback
+# ---------------------------------------------------------------------------
+
+class TestIsSpillReadback:
+    def test_readfile_inside_spill_dir(self, tmp_path: Path) -> None:
+        inside = str(tmp_path / "toolu_abc.txt")
+        assert is_spill_readback("ReadFile", {"file_path": inside}, tmp_path)
+
+    def test_readfile_outside(self, tmp_path: Path) -> None:
+        assert not is_spill_readback(
+            "ReadFile", {"file_path": str(tmp_path.parent / "main.py")}, tmp_path
         )
-        state = create_replacement_state()
 
-        apply_tool_result_budget(conv, tmp_path, state)
+    def test_other_tool(self, tmp_path: Path) -> None:
+        inside = str(tmp_path / "toolu_abc.txt")
+        assert not is_spill_readback("Bash", {"file_path": inside}, tmp_path)
 
-        tr = conv.history[0].tool_results[0]
-        assert tr.content == persisted_content
-        # 外部已预先打过标签的结果同样会被记录到 state.replacements 中，
-        # 这样后续重复应用时仍能保持逐字节一致。
-        assert state.replacements["toolu_done"] == persisted_content
+    def test_missing_path(self, tmp_path: Path) -> None:
+        assert not is_spill_readback("ReadFile", {}, tmp_path)
 
 # ---------------------------------------------------------------------------
 # compute_compact_threshold
@@ -186,20 +179,6 @@ class TestComputeCompactThreshold:
 
     def test_smaller_window(self) -> None:
         assert compute_compact_threshold(128_000) == 95_000
-
-# ---------------------------------------------------------------------------
-# should_auto_compact
-# ---------------------------------------------------------------------------
-
-class TestShouldAutoCompact:
-    def test_below_threshold(self) -> None:
-        assert not should_auto_compact(100_000, 200_000)
-
-    def test_at_threshold(self) -> None:
-        assert should_auto_compact(167_000, 200_000)
-
-    def test_above_threshold(self) -> None:
-        assert should_auto_compact(180_000, 200_000)
 
 # ---------------------------------------------------------------------------
 # extract_summary

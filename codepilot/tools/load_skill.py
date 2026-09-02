@@ -12,6 +12,7 @@ from mewcode.tools.base import Tool, ToolResult
 
 if TYPE_CHECKING:
     from mewcode.agent import Agent
+    from mewcode.skills.executor import SkillExecutor
     from mewcode.skills.loader import SkillLoader
 
 
@@ -28,12 +29,12 @@ class LoadSkill(Tool):
     params_model = LoadSkillParams
     category = "read"
     is_concurrency_safe = False
-    is_system_tool = True
 
 
     def __init__(self) -> None:
         self._loader: SkillLoader | None = None
         self._agent: Agent | None = None
+        self._executor: SkillExecutor | None = None
 
 
     def set_loader(self, loader: SkillLoader) -> None:
@@ -41,6 +42,13 @@ class LoadSkill(Tool):
 
     def set_agent(self, agent: Agent) -> None:
         self._agent = agent
+
+    def set_executor(self, executor: SkillExecutor) -> None:
+        """注入执行器，mode: fork 的 skill 靠它跑隔离子 Agent。
+
+        未注入时 fork 会回退成 inline，保证工具在任何宿主上都能用。
+        """
+        self._executor = executor
 
 
     async def execute(self, params: BaseModel) -> ToolResult:
@@ -59,6 +67,19 @@ class LoadSkill(Tool):
                 output=f"Error: unknown skill '{params.name}'. Available skills: {available}",
                 is_error=True,
             )
+
+        # fork 模式：SOP 正文不进主对话，交给隔离的子 Agent 执行，只把最终结果带回。
+        # 这样模型自己加载 skill 和用户敲斜杠命令遵循同一套 mode 语义，声明的隔离
+        # 意图在两条路径上都生效。
+        if skill.mode == "fork" and self._executor is not None:
+            try:
+                result = await self._executor.execute_fork(skill, "")
+            except Exception as e:
+                return ToolResult(
+                    output=f"Skill '{skill.name}' fork execution failed: {e}",
+                    is_error=True,
+                )
+            return ToolResult(output=result)
 
         self._agent.activate_skill(skill.name, skill.prompt_body)
 

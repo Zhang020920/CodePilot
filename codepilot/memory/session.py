@@ -9,7 +9,6 @@ import random
 import string
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from enum import Enum
 from pathlib import Path
 from typing import IO, Any
 
@@ -26,101 +25,127 @@ SESSION_SUMMARY_PROMPT = (
 
 
 # ---------------------------------------------------------------------------
-# RecordType & SessionRecord
+# SessionRecord
 # ---------------------------------------------------------------------------
 
 
-class RecordType(str, Enum):
-    SYSTEM_PROMPT = "system_prompt"
-    USER = "user"
-    ASSISTANT = "assistant"
-    TOOL_RESULT = "tool_result"
-    COMPRESSION = "compression"
-    # Layer-2 compact 标记。auto_compact 压缩对话记录时写入。
-    # 内容为结构化载荷（参见 make_compact_boundary / parse_compact_boundary），
-    # 包含摘要文本和原样保留的 keep 尾部（以序列化 record 形式内联），
-    # 使 resume 可以仅凭此标记重建压缩后的状态，无需重放标记之前的原始前缀。
-    COMPACT_BOUNDARY = "compact_boundary"
+# 压缩边界记录的类型标记。普通对话消息不带 type，靠 role 区分 user / assistant。
+TYPE_COMPACT_BOUNDARY = "compact_boundary"
+
+
+def _tool_uses_to_dicts(message: Message) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for tu in message.tool_uses or []:
+        d: dict[str, Any] = {"tool_use_id": tu.tool_use_id, "tool_name": tu.tool_name}
+        # arguments 为空时整个键省略，纯文本消息落盘不带多余字段
+        if tu.arguments:
+            d["arguments"] = tu.arguments
+        out.append(d)
+    return out
+
+
+def _tool_results_to_dicts(message: Message) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for tr in message.tool_results or []:
+        d: dict[str, Any] = {"tool_use_id": tr.tool_use_id, "content": tr.content}
+        # is_error 为 False 时省略，成功的工具结果不留 "is_error":false 这种噪音
+        if tr.is_error:
+            d["is_error"] = tr.is_error
+        out.append(d)
+    return out
 
 
 @dataclass
 class SessionRecord:
-    type: RecordType
+    """一条落盘的会话记录。
+
+    工具块以与协议无关的内部表示内联存储（tool_use_id / tool_name / arguments），
+    换 provider 恢复会话时也能还原；两者为空时不写入 JSON。普通消息 type 为 None，
+    靠 role 区分；type 为 "compact_boundary" 时 content 是压缩边界的结构化载荷。
+    """
+
+    role: str
     content: Any
     timestamp: datetime
-    tool_use_id: str | None = None
-    is_error: bool = False
+    type: str | None = None
+    tool_uses: list[dict[str, Any]] = field(default_factory=list)
+    tool_results: list[dict[str, Any]] = field(default_factory=list)
+
+    def is_compact_boundary(self) -> bool:
+        return self.type == TYPE_COMPACT_BOUNDARY
 
     def to_jsonl(self) -> str:
         data: dict[str, Any] = {
-            "type": self.type.value,
+            "role": self.role,
             "content": self.content,
-            "timestamp": self.timestamp.isoformat(),
+            "ts": int(self.timestamp.timestamp()),
         }
-        if self.tool_use_id is not None:
-            data["tool_use_id"] = self.tool_use_id
-        if self.type == RecordType.TOOL_RESULT:
-            data["is_error"] = self.is_error
-        return json.dumps(data, ensure_ascii=False)
-
+        if self.type:
+            data["type"] = self.type
+        if self.tool_uses:
+            data["tool_uses"] = self.tool_uses
+        if self.tool_results:
+            data["tool_results"] = self.tool_results
+        return json.dumps(data, ensure_ascii=False, separators=(",", ":"))
 
     @classmethod
     def from_jsonl(cls, line: str) -> SessionRecord | None:
         try:
             data = json.loads(line)
-            return cls(
-                type=RecordType(data["type"]),
-                content=data["content"],
-                timestamp=datetime.fromisoformat(data["timestamp"]),
-                tool_use_id=data.get("tool_use_id"),
-                is_error=data.get("is_error", False),
-            )
-        except (json.JSONDecodeError, KeyError, ValueError):
+        except json.JSONDecodeError:
             return None
+        if not isinstance(data, dict) or "role" not in data:
+            # 旧格式（以 type 区分 user/assistant/tool_result）或损坏行安全跳过
+            return None
+        ts_raw = data.get("ts")
+        if isinstance(ts_raw, (int, float)):
+            ts = datetime.fromtimestamp(ts_raw, tz=timezone.utc)
+        else:
+            ts = datetime.now(timezone.utc)
+        return cls(
+            role=data["role"],
+            content=data.get("content", ""),
+            timestamp=ts,
+            type=data.get("type"),
+            tool_uses=data.get("tool_uses") or [],
+            tool_results=data.get("tool_results") or [],
+        )
 
     @classmethod
     def from_message(cls, message: Message) -> list[SessionRecord]:
-        now = datetime.now(timezone.utc)
-        records: list[SessionRecord] = []
-
-        if message.tool_results:
-            for tr in message.tool_results:
-                records.append(
-                    cls(
-                        type=RecordType.TOOL_RESULT,
-                        content=tr.content,
-                        timestamp=now,
-                        tool_use_id=tr.tool_use_id,
-                        is_error=tr.is_error,
-                    )
-                )
-        elif message.role == "assistant":
-            if message.tool_uses:
-                content_blocks: list[dict[str, Any]] = []
-                if message.content:
-                    content_blocks.append({"type": "text", "text": message.content})
-                for tu in message.tool_uses:
-                    content_blocks.append(
-                        {
-                            "type": "tool_use",
-                            "id": tu.tool_use_id,
-                            "name": tu.tool_name,
-                            "input": tu.arguments,
-                        }
-                    )
-                records.append(
-                    cls(type=RecordType.ASSISTANT, content=content_blocks, timestamp=now)
-                )
-            else:
-                records.append(
-                    cls(type=RecordType.ASSISTANT, content=message.content, timestamp=now)
-                )
-        else:
-            records.append(
-                cls(type=RecordType.USER, content=message.content, timestamp=now)
+        # 一条 Message 对应一条记录，工具块内联其中；思考块不落盘：它的
+        # signature 只在同一轮工具循环内需要回传，跨会话恢复用不上。
+        return [
+            cls(
+                role=message.role,
+                content=message.content,
+                timestamp=datetime.now(timezone.utc),
+                tool_uses=_tool_uses_to_dicts(message),
+                tool_results=_tool_results_to_dicts(message),
             )
+        ]
 
-        return records
+    def to_message(self) -> Message:
+        return Message(
+            role=self.role,
+            content=self.content if isinstance(self.content, str) else "",
+            tool_uses=[
+                ToolUseBlock(
+                    tool_use_id=tu.get("tool_use_id", ""),
+                    tool_name=tu.get("tool_name", ""),
+                    arguments=tu.get("arguments", {}),
+                )
+                for tu in self.tool_uses
+            ],
+            tool_results=[
+                ToolResultBlock(
+                    tool_use_id=tr.get("tool_use_id", ""),
+                    content=tr.get("content", ""),
+                    is_error=tr.get("is_error", False),
+                )
+                for tr in self.tool_results
+            ],
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -128,40 +153,32 @@ class SessionRecord:
 # ---------------------------------------------------------------------------
 
 
-def _message_to_record_dicts(message: Message) -> list[dict[str, Any]]:
-    """将单条 Message 序列化为与磁盘存储格式一致的 record-dict 列表。
-
-    复用 SessionRecord.from_message，使内联的 keep 尾部与正常追加消息的持久化
-    结果逐字节一致（assistant 的 tool_uses 变为 content-blocks 列表，每个
-    tool_result 独立成一条 record）。这保证了 tool_use↔tool_result 配对的
-    无损往返——不像纯 role+content 文本导出那样会丢失 tool call 的关联关系。
-    """
-    dicts: list[dict[str, Any]] = []
-    for rec in SessionRecord.from_message(message):
-        data: dict[str, Any] = {"type": rec.type.value, "content": rec.content}
-        if rec.tool_use_id is not None:
-            data["tool_use_id"] = rec.tool_use_id
-        if rec.type == RecordType.TOOL_RESULT:
-            data["is_error"] = rec.is_error
-        dicts.append(data)
-    return dicts
+def _message_to_keep_dict(message: Message) -> dict[str, Any]:
+    """将一条保留的尾巴消息序列化成压缩边界里内联的 dict，格式与普通落盘记录一致。"""
+    data: dict[str, Any] = {"role": message.role, "content": message.content}
+    tool_uses = _tool_uses_to_dicts(message)
+    tool_results = _tool_results_to_dicts(message)
+    if tool_uses:
+        data["tool_uses"] = tool_uses
+    if tool_results:
+        data["tool_results"] = tool_results
+    return data
 
 
 def make_compact_boundary(summary: str, keep: list[Message]) -> SessionRecord:
-    """构建一条 COMPACT_BOUNDARY record，内联摘要和原样保留的 keep 尾部。
+    """构建一条 compact_boundary 记录，内联摘要和原样保留的 keep 尾部。
 
-    `keep` 是 auto_compact 原样保留的近期尾部消息。将其存储在 boundary record
-    内部（而不是依赖它在文件中的物理位置），意味着 resume 可以仅凭 boundary
-    重建压缩后的状态——boundary 之前的原始前缀保留在磁盘上但不会被重放。
+    `keep` 是 auto_compact 原样保留的近期尾部消息，连同工具块一起内联进 boundary，
+    压缩后恢复会话时这段尾巴才不会缺掉调用链。boundary 之前的原始前缀保留在磁盘上
+    但不会被重放。
     """
-    keep_dicts: list[dict[str, Any]] = []
-    for msg in keep:
-        keep_dicts.extend(_message_to_record_dicts(msg))
+    keep_dicts = [_message_to_keep_dict(msg) for msg in keep]
     payload = {"summary": summary, "keep": keep_dicts}
     return SessionRecord(
-        type=RecordType.COMPACT_BOUNDARY,
+        role="system",
         content=payload,
         timestamp=datetime.now(timezone.utc),
+        type=TYPE_COMPACT_BOUNDARY,
     )
 
 
@@ -176,23 +193,20 @@ def parse_compact_boundary(record: SessionRecord) -> tuple[str, list[Message]]:
         return "", []
     summary = content.get("summary", "")
     keep_raw = content.get("keep", [])
-    keep_records: list[SessionRecord] = []
+    keep_messages: list[Message] = []
     for item in keep_raw if isinstance(keep_raw, list) else []:
-        if not isinstance(item, dict) or "type" not in item:
+        if not isinstance(item, dict) or "role" not in item:
             continue
-        try:
-            keep_records.append(
-                SessionRecord(
-                    type=RecordType(item["type"]),
-                    content=item.get("content"),
-                    timestamp=record.timestamp,
-                    tool_use_id=item.get("tool_use_id"),
-                    is_error=item.get("is_error", False),
-                )
-            )
-        except ValueError:
-            continue
-    return summary, records_to_messages(keep_records)
+        keep_messages.append(
+            SessionRecord(
+                role=item["role"],
+                content=item.get("content", ""),
+                timestamp=record.timestamp,
+                tool_uses=item.get("tool_uses") or [],
+                tool_results=item.get("tool_results") or [],
+            ).to_message()
+        )
+    return summary, keep_messages
 
 
 # ---------------------------------------------------------------------------
@@ -200,112 +214,30 @@ def parse_compact_boundary(record: SessionRecord) -> tuple[str, list[Message]]:
 # ---------------------------------------------------------------------------
 
 
+# 压缩摘要在恢复会话时作为一条 user 消息重放，前缀说明这段是早期对话的浓缩。
+RESUME_SUMMARY_PREFIX = (
+    "本次会话延续自之前的对话，因上下文空间不足进行了压缩。以下是早期对话的摘要：\n\n"
+)
+
+
 def records_to_messages(records: list[SessionRecord]) -> list[Message]:
+    """把落盘记录还原成内存中的对话消息。
+
+    每条记录对应一条消息，工具块随记录一起还原；压缩边界展开成「摘要 user 消息 +
+    原样保留的 keep 尾部」。恢复出来的历史可能含中断留下的悬空 tool_use，交由发
+    请求前的 ensure_tool_pairing 统一补齐，这里不做截断。
+    """
     messages: list[Message] = []
-    pending_tool_results: list[ToolResultBlock] = []
-
     for record in records:
-        if record.type == RecordType.TOOL_RESULT:
-            pending_tool_results.append(
-                ToolResultBlock(
-                    tool_use_id=record.tool_use_id or "",
-                    content=(
-                        record.content
-                        if isinstance(record.content, str)
-                        else json.dumps(record.content)
-                    ),
-                    is_error=record.is_error,
-                )
-            )
-            continue
-
-        if pending_tool_results:
-            messages.append(
-                Message(role="user", content="", tool_results=pending_tool_results)
-            )
-            pending_tool_results = []
-
-        if record.type == RecordType.SYSTEM_PROMPT:
-            continue
-
-        if record.type == RecordType.COMPRESSION:
-            messages.append(
-                Message(
-                    role="user",
-                    content="本次会话延续自之前的对话，因上下文空间不足进行了压缩。以下是早期对话的摘要：\n\n" + (record.content or ""),
-                )
-            )
-            continue
-
-        if record.type == RecordType.COMPACT_BOUNDARY:
-            # 内联展开：摘要作为 user 消息，后接原样保留的 keep 尾部。
-            # resume() 通常已预裁剪到最后一个 boundary，所以这里只会处理
-            # 权威的那一条；但在此展开可以保证 records_to_messages 对任何
-            # 直接调用者都保持自洽。
+        if record.is_compact_boundary():
             summary, keep_messages = parse_compact_boundary(record)
-            messages.append(Message(role="user", content="本次会话延续自之前的对话，因上下文空间不足进行了压缩。以下是早期对话的摘要：\n\n" + summary))
+            messages.append(Message(role="user", content=RESUME_SUMMARY_PREFIX + summary))
             messages.extend(keep_messages)
             continue
-
-        if record.type == RecordType.USER:
-            messages.append(Message(role="user", content=record.content or ""))
-        elif record.type == RecordType.ASSISTANT:
-            if isinstance(record.content, list):
-                text = ""
-                tool_uses: list[ToolUseBlock] = []
-                for block in record.content:
-                    if not isinstance(block, dict):
-                        continue
-                    if block.get("type") == "text":
-                        text += block.get("text", "")
-                    elif block.get("type") == "tool_use":
-                        tool_uses.append(
-                            ToolUseBlock(
-                                tool_use_id=block.get("id", ""),
-                                tool_name=block.get("name", ""),
-                                arguments=block.get("input", {}),
-                            )
-                        )
-                messages.append(
-                    Message(role="assistant", content=text, tool_uses=tool_uses)
-                )
-            else:
-                messages.append(
-                    Message(role="assistant", content=record.content or "")
-                )
-
-    if pending_tool_results:
-        messages.append(
-            Message(role="user", content="", tool_results=pending_tool_results)
-        )
-
+        if record.role not in ("user", "assistant"):
+            continue
+        messages.append(record.to_message())
     return messages
-
-
-# ---------------------------------------------------------------------------
-# 消息链校验
-# ---------------------------------------------------------------------------
-
-
-def validate_message_chain(records: list[SessionRecord]) -> int:
-    last_valid = 0
-    pending_tool_uses: set[str] = set()
-
-    for i, record in enumerate(records):
-        if record.type == RecordType.ASSISTANT and isinstance(record.content, list):
-            for block in record.content:
-                if isinstance(block, dict) and block.get("type") == "tool_use":
-                    tool_id = block.get("id", "")
-                    if tool_id:
-                        pending_tool_uses.add(tool_id)
-
-        if record.type == RecordType.TOOL_RESULT and record.tool_use_id:
-            pending_tool_uses.discard(record.tool_use_id)
-
-        if not pending_tool_uses:
-            last_valid = i + 1
-
-    return last_valid
 
 
 # ---------------------------------------------------------------------------
@@ -522,13 +454,11 @@ class SessionManager:
         # 普通消息（续写）照常重放。没有 boundary 则全量重放（兼容旧 session）。
         last_boundary = -1
         for i, rec in enumerate(records):
-            if rec.type == RecordType.COMPACT_BOUNDARY:
+            if rec.is_compact_boundary():
                 last_boundary = i
         if last_boundary >= 0:
             records = records[last_boundary:]
 
-        valid_count = validate_message_chain(records)
-        records = records[:valid_count]
         messages = records_to_messages(records)
 
         file = open(jsonl_path, "a", encoding="utf-8")  # noqa: SIM115

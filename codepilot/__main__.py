@@ -14,20 +14,30 @@ import sys
 import time
 from pathlib import Path
 
+from mewcode import crashlog
 from mewcode.config import ConfigError, load_config
 from mewcode.hooks import HookConfigError, HookEngine, load_hooks
 from mewcode.permissions import PermissionMode
 
 
 def main() -> None:
+    # 队友 worker 模式：由 tmux/iTerm2 窗格用 `-m mewcode --teammate ...` 拉起。
+    # 必须在 argparse 之前拦截，走独立的 worker 分支而不是正常 TUI。
+    teammate = _parse_teammate_flags(sys.argv[1:])
+    if teammate is not None:
+        asyncio.run(_run_teammate(*teammate))
+        return
+
     # 先确保 .mewcode/ 目录存在，否则下面写 debug.log 会因目录不存在而崩溃
     Path(".mewcode").mkdir(parents=True, exist_ok=True)
+    # 追加写：排查异常退出要看的往往是上一次运行的日志，覆盖会把现场冲掉
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(name)s %(message)s",
         filename=".mewcode/debug.log",
-        filemode="w",
+        filemode="a",
     )
+    crashlog.install()
 
     parser = argparse.ArgumentParser(prog="mewcode", description="MewCode AI coding assistant")
     parser.add_argument(
@@ -86,6 +96,7 @@ def main() -> None:
             providers=config.providers,
             mcp_servers=config.mcp_servers,
             hook_engine=hook_engine,
+            config=config,
         )
         asyncio.run(server.run())
         return
@@ -106,7 +117,13 @@ def main() -> None:
         driver_class=NoAltScreenDriver,
         sandbox_config=config.sandbox,
     )
-    app.run()
+    # TUI 内部的异常由 App._handle_exception 落盘，这里兜住的是框架之外的部分：
+    # 启动、事件循环收尾，以及 Textual 自身抛出的异常
+    try:
+        app.run()
+    except BaseException as e:
+        crashlog.record_exception("app.run", e)
+        raise
 
 
 async def _run_prompt(config, permission_mode, hook_engine, prompt: str, output_format: str = "text") -> None:
@@ -140,6 +157,7 @@ async def _run_prompt(config, permission_mode, hook_engine, prompt: str, output_
     from mewcode.agents.trace import TraceManager
     from mewcode.tools.agent_tool import AgentTool
     from mewcode.tools.impl.tool_search import ToolSearchTool
+    from mewcode.tools.mcp_call import McpCallTool
     from mewcode.teams.manager import TeamManager
     from mewcode.teams.models import BackendType
     from mewcode.tools.team_create import TeamCreateTool
@@ -175,6 +193,7 @@ async def _run_prompt(config, permission_mode, hook_engine, prompt: str, output_
     instructions = load_instructions(work_dir)
     registry = create_default_registry()
     registry.register(ToolSearchTool(registry, protocol=provider.protocol))
+    registry.register(McpCallTool(registry))
 
     agent = Agent(
         client=client,
@@ -217,6 +236,41 @@ async def _run_prompt(config, permission_mode, hook_engine, prompt: str, output_
         enable_coordinator_mode=config.enable_coordinator_mode,
     ))
     registry.register(TeamDeleteTool(team_manager=team_manager, parent_agent=agent))
+
+    from mewcode.tools.send_message import SendMessageTool
+    from mewcode.tools.synthetic_output import SyntheticOutputTool
+    from mewcode.tools.task_stop import TaskStopTool
+
+    registry.register(SyntheticOutputTool())
+    registry.register(TaskStopTool(team_manager=team_manager))
+    # Lead 给队员派活、续写都走这个工具，团队要等 TeamCreate 才存在，
+    # 所以这里不绑定团队，发信时再取当前团队
+    registry.register(SendMessageTool(team_manager=team_manager))
+
+    # 连 MCP。放在所有内建工具注册完之后：MCP 工具的加载模式要按 schema 总量
+    # 跟上下文窗口比，得等工具都在位才算得准。
+    mcp_manager = None
+    if config.mcp_servers:
+        from mewcode.mcp import MCPManager
+        from mewcode.mcp.loading_strategy import decide_and_apply
+
+        mcp_manager = MCPManager()
+        mcp_manager.load_configs(config.mcp_servers)
+        connect_result = await mcp_manager.register_all_tools(registry)
+        for err in connect_result.errors:
+            print(f"MCP warning: {err}", file=sys.stderr)
+        decide_and_apply(
+            registry,
+            base_url=provider.base_url,
+            context_window=provider.get_context_window(),
+        )
+
+    # coordinator 模式由配置决定，开了就从第一轮起收窄工具集
+    if config.enable_coordinator_mode:
+        from mewcode.agents.tool_filter import apply_coordinator_filter
+
+        agent.enable_coordinator_mode = True
+        agent.registry = apply_coordinator_filter(agent.registry)
 
     def drain_notifications() -> list[str]:
         notes: list[str] = []
@@ -356,6 +410,232 @@ async def _run_prompt(config, permission_mode, hook_engine, prompt: str, output_
             emit_json({"type": "assistant", "text": last_result})
         else:
             print(last_result, flush=True)
+
+    if mcp_manager is not None:
+        # 多个 stdio 服务器同时收尾时，底层的 anyio cancel scope 会互相打断并抛
+        # CancelledError。结果已经输出完了，这里不该因为收尾失败而带崩整个命令。
+        try:
+            await mcp_manager.shutdown()
+        except (Exception, asyncio.CancelledError):
+            pass
+
+
+def _parse_teammate_flags(args: list[str]) -> tuple[str, str] | None:
+    """从 CLI 参数里解析队友 worker 模式。
+
+    仅当首个参数是 --teammate 时返回 (team_name, agent_name)，表示 worker 模式；
+    否则返回 None，调用方应启动正常 TUI。格式对齐 build_teammate_cli 的产出：
+
+        --teammate --team-name <t> --agent-name <n>
+    """
+    if not args or args[0] != "--teammate":
+        return None
+    team_name = ""
+    agent_name = ""
+    i = 1
+    while i < len(args):
+        if args[i] == "--team-name" and i + 1 < len(args):
+            team_name = args[i + 1]
+            i += 2
+            continue
+        if args[i] == "--agent-name" and i + 1 < len(args):
+            agent_name = args[i + 1]
+            i += 2
+            continue
+        i += 1
+    return team_name, agent_name
+
+
+async def _build_teammate_registry(
+    work_dir: str,
+    protocol: str,
+    team_manager: "TeamManager",
+    team_name: str,
+    agent_name: str,
+    mcp_servers: list,
+    base_url: str = "",
+    context_window: int = 0,
+):
+    """组装队友工具集。
+
+    文件与命令工具、工具检索、Worktree 切换、Skill、MCP 扩展，再加上团队协作工具
+    （按自己的名字发消息，以及读写团队共享任务板）。任务板按团队名解析到同一份
+    tasks.json，所以队友之间看到的是同一张表。
+
+    Agent 不在其中，调用树到队友这一层为止，队友不再往下派子 Agent。
+    TeamCreate 与 TeamDelete 也不在其中，组建和解散团队是 Lead 的职责。
+    """
+    from mewcode.config import WorktreeConfig
+    from mewcode.mcp import MCPManager
+    from mewcode.tools import create_default_registry
+    from mewcode.tools.enter_worktree import EnterWorktreeTool
+    from mewcode.tools.exit_worktree import ExitWorktreeTool
+    from mewcode.tools.impl.tool_search import ToolSearchTool
+    from mewcode.tools.mcp_call import McpCallTool
+    from mewcode.tools.install_skill import InstallSkillTool
+    from mewcode.tools.load_skill import LoadSkill
+    from mewcode.tools.send_message import SendMessageTool
+    from mewcode.tools.synthetic_output import SyntheticOutputTool
+    from mewcode.tools.task_create import TaskCreateTool
+    from mewcode.tools.task_get import TaskGetTool
+    from mewcode.tools.task_list import TaskListTool
+    from mewcode.tools.task_update import TaskUpdateTool
+    from mewcode.worktree import WorktreeManager
+
+    registry = create_default_registry()
+    registry.register(ToolSearchTool(registry, protocol=protocol))
+    registry.register(McpCallTool(registry))
+    registry.register(SyntheticOutputTool())
+
+    wt_manager = WorktreeManager(
+        repo_root=work_dir,
+        symlink_directories=WorktreeConfig().symlink_directories,
+    )
+    registry.register(EnterWorktreeTool(worktree_manager=wt_manager))
+    registry.register(ExitWorktreeTool(worktree_manager=wt_manager))
+
+    # 未注入执行器，声明 fork 模式的 skill 会退回 inline 执行
+    registry.register(LoadSkill())
+    registry.register(InstallSkillTool())
+
+    registry.register(SendMessageTool(
+        team_manager=team_manager,
+        team_name=team_name,
+        from_agent_id=agent_name,
+        from_agent_name=agent_name,
+    ))
+    registry.register(TaskCreateTool(team_manager, team_name, agent_name))
+    registry.register(TaskGetTool(team_manager, team_name))
+    registry.register(TaskListTool(team_manager, team_name))
+    registry.register(TaskUpdateTool(team_manager, team_name))
+
+    if mcp_servers:
+        try:
+            from mewcode.mcp.loading_strategy import decide_and_apply
+
+            manager = MCPManager()
+            manager.load_configs(mcp_servers)
+            result = await manager.register_all_tools(registry)
+            for err in result.errors:
+                print(f"MCP warning: {err}", file=sys.stderr)
+            # 工具都在位了才算得准 schema 总量跟上下文窗口的比例
+            decide_and_apply(
+                registry, base_url=base_url, context_window=context_window
+            )
+        except Exception as e:  # MCP 连不上不应该拖垮队友进程
+            print(f"MCP setup failed: {e}", file=sys.stderr)
+
+    return registry
+
+
+async def _run_teammate(team_name: str, agent_name: str) -> None:
+    """把本进程作为已有团队的队友 worker 启动。
+
+    流程：加载 config → 建 LLM client → 建工具集（含 SendMessage）→ 定位团队邮箱
+    （lead 已在磁盘上创建）→ 建子 agent → 注册成员名字 → 跑队友主循环，
+    首个任务由 lead 在 spawn 前写进邮箱、worker 首次空闲轮询取出。
+    """
+    from mewcode.agent import Agent
+    from mewcode.client import create_client, resolve_context_window
+    from mewcode.memory.instructions import load_instructions
+    from mewcode.permissions import (
+        DangerousCommandDetector,
+        PathSandbox,
+        PermissionChecker,
+        PermissionMode,
+        RuleEngine,
+    )
+    from mewcode.teams.manager import TeamManager
+    from mewcode.teams.registry import AgentNameRegistry
+    from mewcode.teams.spawn_inprocess import LEAD_NAME, spawn_inprocess_teammate
+
+    # worker 无 TUI，日志走 stderr，供 tmux/iTerm2 窗格直接显示
+    logging.basicConfig(level=logging.INFO, stream=sys.stderr, force=True)
+
+    if not team_name or not agent_name:
+        print("--teammate requires --team-name and --agent-name", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        config = load_config()
+    except ConfigError as e:
+        print(f"Error loading config: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    if not config.providers:
+        print("No providers configured", file=sys.stderr)
+        sys.exit(1)
+
+    provider = config.providers[0]
+    client = create_client(provider)
+    await resolve_context_window(provider)
+
+    work_dir = os.getcwd()
+
+    # 团队目录由 lead 在磁盘上建好，worker 按团队名加载团队与邮箱
+    team_manager = TeamManager()
+    team = team_manager.get_team(team_name)
+    if team is None:
+        print(f"Team '{team_name}' not found", file=sys.stderr)
+        sys.exit(1)
+    mailbox = team_manager.get_mailbox(team_name)
+    if mailbox is None:
+        print(f"Mailbox for team '{team_name}' not found", file=sys.stderr)
+        sys.exit(1)
+
+    # 名字解析表：登记自己和 lead，便于 SendMessage 按名字投递
+    name_registry = AgentNameRegistry.instance()
+    name_registry.register(agent_name, agent_name)
+    name_registry.register(LEAD_NAME, team.lead_agent_id)
+
+    registry = await _build_teammate_registry(
+        work_dir=work_dir,
+        protocol=provider.protocol,
+        team_manager=team_manager,
+        team_name=team_name,
+        agent_name=agent_name,
+        mcp_servers=config.mcp_servers,
+        base_url=provider.base_url,
+        context_window=provider.get_context_window(),
+    )
+
+    checker = PermissionChecker(
+        detector=DangerousCommandDetector(),
+        sandbox=PathSandbox(work_dir),
+        rule_engine=RuleEngine(
+            user_rules_path=Path.home() / ".mewcode" / "permissions.yaml",
+            project_rules_path=Path(work_dir) / ".mewcode" / "permissions.yaml",
+            local_rules_path=Path(work_dir) / ".mewcode" / "permissions.local.yaml",
+        ),
+        mode=PermissionMode.BYPASS,
+    )
+
+    agent = Agent(
+        client=client,
+        registry=registry,
+        protocol=provider.protocol,
+        work_dir=work_dir,
+        permission_checker=checker,
+        context_window=provider.get_context_window(),
+        instructions_content=load_instructions(work_dir),
+    )
+
+    # 不传初始 prompt：lead 已把首个任务写进邮箱，主循环首次轮询即可取到，
+    # 避免重复注入一条 user 消息。
+    print(f"[teammate {team_name}/{agent_name}] booted, awaiting tasks", file=sys.stderr)
+    handle = spawn_inprocess_teammate(
+        agent=agent,
+        prompt="",
+        name=agent_name,
+        team_name=team_name,
+        mailbox=mailbox,
+        # 外部 worker 把 idle 通知写到 lead 实际读取的键，保证回传对得上
+        lead_key=team.lead_agent_id,
+    )
+    try:
+        await handle.task
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        handle.cancel()
 
 
 if __name__ == "__main__":

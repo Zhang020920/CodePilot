@@ -10,11 +10,13 @@ from typing import Any
 
 from mewcode.permissions.dangerous import DangerousCommandDetector, is_safe_command
 from mewcode.permissions.modes import DecisionEffect, PermissionMode, mode_decide
-from mewcode.permissions.rules import RuleEngine, extract_content
+from mewcode.permissions.rules import Rule, RuleEngine, evaluate_rules, extract_content
 from mewcode.permissions.sandbox import PathSandbox
 from mewcode.tools.base import Tool
 
 _PLAN_MODE_ALLOWED_TOOLS = frozenset({"Agent", "ToolSearch", "AskUserQuestion", "ExitPlanMode"})
+# mcp_call 刻意不进 plan 白名单：ToolSearch 只是读 schema，而 mcp_call 会真的
+# 打到外部服务、可能改状态，plan 模式下仍要按权限规则逐个确认。
 
 
 @dataclass
@@ -41,35 +43,10 @@ class PermissionChecker:
         self.plan_file_path: str = ""
         # OS 级沙箱是否启用（开启后命令类工具可自动放行，因为内核会兜底）
         self.sandbox_enabled = sandbox_enabled
-        # Layer 4b: 会话级 allow-always 集合（内存中，不持久化）
-        # 存放格式为 "ToolName:pattern"，用户选择 "don't ask again" 时记录
-        self._session_allowed: set[str] = set()
-
-
-    def add_session_allow(self, tool_name: str, content: str) -> None:
-        """将工具+内容模式加入会话级放行集合（Layer 4b）。
-
-        比持久化规则引擎优先级更高，但不写入磁盘——会话结束即消失。
-        """
-        key = f"{tool_name}:{content}"
-        self._session_allowed.add(key)
-
-    def _check_session_allowed(self, tool_name: str, content: str) -> bool:
-        """检查是否匹配会话级放行记录。"""
-        if not self._session_allowed:
-            return False
-        key = f"{tool_name}:{content}"
-        if key in self._session_allowed:
-            return True
-        # 前缀匹配：已记录的 pattern 可能带通配尾缀
-        for allowed in self._session_allowed:
-            if allowed.endswith("*") and key.startswith(allowed[:-1]):
-                return True
-        return False
 
     @staticmethod
     def describe_tool_action(tool_name: str, arguments: dict[str, Any]) -> str:
-        """为 HITL 确认生成人类可读的操作描述（对齐 Go 版 ExtractContent + formatToolArgs）。"""
+        """为 HITL 确认生成人类可读的操作描述。"""
         content = extract_content(tool_name, arguments)
         if content:
             return content
@@ -85,6 +62,16 @@ class PermissionChecker:
 
     def check(self, tool: Tool, arguments: dict[str, Any]) -> Decision:
         content = extract_content(tool.name, arguments)
+
+        # 规则快照按需取一次：安全命令、危险命令这些在前面几层就返回，压根不必碰规则文件；
+        # 复合命令逐条检查子命令时共用同一份快照，不重复读盘
+        snapshot: list[Rule] | None = None
+
+        def rules() -> list[Rule]:
+            nonlocal snapshot
+            if snapshot is None:
+                snapshot = self.rule_engine.snapshot()
+            return snapshot
 
         # Layer 0: Plan 模式例外放行
         if self.mode == PermissionMode.PLAN:
@@ -107,7 +94,7 @@ class PermissionChecker:
         # Layer 1c: OS 沙箱自动放行
         # 沙箱开启时，命令类工具通过了危险命令检查后直接放行——
         # 内核级隔离会阻止越权写入，无需再弹确认。
-        # 对齐 Claude Code checkSandboxAutoAllow：拆分复合命令逐条检查，
+        # 拆分复合命令逐条检查，防止通过命令拼接绕过权限检查，
         # deny 规则和 ask 规则不受沙箱影响。
         if self.sandbox_enabled and tool.category == "command":
             import re
@@ -116,7 +103,7 @@ class PermissionChecker:
                 subcommands = [content]
             has_ask = False
             for sub in subcommands:
-                rule_result = self.rule_engine.evaluate(tool.name, sub)
+                rule_result = evaluate_rules(rules(), tool.name, sub)
                 if rule_result == "deny":
                     return Decision(effect="deny", reason="权限规则拒绝")
                 if rule_result == "ask":
@@ -127,20 +114,23 @@ class PermissionChecker:
 
         # Layer 2: 路径沙箱（仅文件类工具）
         if tool.category in ("read", "write") and content:
+            # 受保护路径优先判定：写入权限配置或 Skill 定义一律拒绝，bypass 模式同样拦截
+            if tool.category == "write":
+                ok, reason = self.sandbox.check_deny_write(content)
+                if not ok:
+                    return Decision(effect="deny", reason=f"受保护路径: {reason}")
             ok, reason = self.sandbox.check(content)
             if not ok and self.mode != PermissionMode.BYPASS:
                 return Decision(effect="ask", reason=f"路径沙箱拦截: {reason}")
 
         # Layer 3: 规则引擎匹配
-        rule_result = self.rule_engine.evaluate(tool.name, content)
+        rule_result = evaluate_rules(rules(), tool.name, content)
         if rule_result == "allow":
             return Decision(effect="allow", reason="权限规则放行")
+        if rule_result == "ask":
+            return Decision(effect="ask", reason="权限规则要求确认")
         if rule_result == "deny":
             return Decision(effect="deny", reason="权限规则拒绝")
-
-        # Layer 4b: 会话级放行（内存中，优先于模式兜底）
-        if self._check_session_allowed(tool.name, content or ""):
-            return Decision(effect="allow", reason="会话级放行（session allow-always）")
 
         # Layer 4: 权限模式兜底判定
         effect = mode_decide(self.mode, tool.category)

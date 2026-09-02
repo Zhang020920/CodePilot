@@ -13,6 +13,8 @@ from openai import AsyncOpenAI
 
 from mewcode.config import ProviderConfig
 from mewcode.conversation import ConversationManager
+from mewcode.mcp.loading_strategy import NATIVE_TOOL_SEARCH_BETA
+from mewcode.conversation_pairing import ensure_tool_pairing
 from mewcode.serialization import (
     build_anthropic_messages,
     build_chat_completion_messages,
@@ -67,20 +69,35 @@ def _mark_last_user_tail_for_cache(messages: list[dict[str, Any]]) -> None:
         return
 
 
+def needs_tool_search_beta(tools: list[dict[str, Any]]) -> bool:
+    """这批工具里有没有带 defer_loading 的。
+
+    只在真用到时才发 beta header：不认识它的端点收到会直接拒请求，而
+    dispatch / eager 两条路压根不需要它。
+    """
+    return any(t.get("defer_loading") for t in tools)
+
+
 def _mark_last_tool_for_cache(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """返回一个浅拷贝的 tools 列表，并在最后一个 tool 上标记 cache_control。
+    """返回一个浅拷贝的 tools 列表，并在最后一个非延迟 tool 上标记 cache_control。
 
     tool schema 在多轮对话之间是稳定的，因此标记列表尾部即可缓存整个 tool block。
     我们不直接修改调用方传入的列表，因为这些 tool schema 往往是注册表里的
     模块级单例。
+
+    断点必须落在非延迟的工具上：带 defer_loading 的工具不允许同时带 cache_control，
+    官方端点会直接拒掉整个请求。MCP 工具是在内建工具之后注册的，所以列表尾部往往
+    正是延迟工具，必须往前找。内建工具永远不延迟，所以总能找到落点。
     """
     if not tools:
         return tools
-    marked = list(tools)
-    last = dict(marked[-1])
-    last["cache_control"] = _EPHEMERAL
-    marked[-1] = last
-    return marked
+    for i in range(len(tools) - 1, -1, -1):
+        if tools[i].get("defer_loading"):
+            continue
+        marked = list(tools)
+        marked[i] = {**tools[i], "cache_control": _EPHEMERAL}
+        return marked
+    return tools
 
 
 class LLMError(Exception):
@@ -170,12 +187,14 @@ class AnthropicClient(LLMClient):
     ) -> AsyncIterator[StreamEvent]:
         import anthropic as _anthropic
 
-        messages = build_anthropic_messages(conversation.get_messages())
+        # 发请求前补齐工具调用与结果的配对：中断、恢复会话、并发交错都可能留下
+        # 悬空的 tool_use，缺配对会被 API 直接拒掉。
+        messages = build_anthropic_messages(ensure_tool_pairing(conversation.get_messages()))
 
         # 在最长稳定前缀上标记 prompt cache 断点：system、tools
         # 以及最后一条 user 消息的尾部。Anthropic 会缓存到每个断点，
-        # 并在下次请求时按字节比对——context.manager 中的
-        # ContentReplacementState 保证断点之后的 tool_result 内容保持稳定。
+        # 并在下次请求时按字节比对。tool_result 内容在入历史时就已定型、
+        # 之后不再改动，断点之后的字节天然保持稳定。
         _mark_last_user_tail_for_cache(messages)
 
         kwargs: dict[str, Any] = {
@@ -191,6 +210,13 @@ class AnthropicClient(LLMClient):
             }]
         if tools:
             kwargs["tools"] = _mark_last_tool_for_cache(tools)
+            # 工具带了 defer_loading 就必须带上这个 beta header，否则服务端不认
+            # 这个字段。只有官方端点会走到这里（见 mcp.loading_strategy）。
+            if needs_tool_search_beta(tools):
+                kwargs["extra_headers"] = {
+                    **kwargs.get("extra_headers", {}),
+                    "anthropic-beta": NATIVE_TOOL_SEARCH_BETA,
+                }
 
         if self.thinking:
             if _supports_adaptive_thinking(self.model):
@@ -345,7 +371,7 @@ class OpenAIClient(LLMClient):
     ) -> AsyncIterator[StreamEvent]:
         import openai as _openai
 
-        input_messages = build_openai_input(conversation.get_messages())
+        input_messages = build_openai_input(ensure_tool_pairing(conversation.get_messages()))
 
         kwargs: dict[str, Any] = {
             "model": self.model,
@@ -505,7 +531,7 @@ class OpenAICompatClient(LLMClient):
     ) -> AsyncIterator[StreamEvent]:
         import openai as _openai
 
-        messages = build_chat_completion_messages(conversation.get_messages())
+        messages = build_chat_completion_messages(ensure_tool_pairing(conversation.get_messages()))
 
         # 如果有 system 消息则插入到消息列表头部。
         if system:

@@ -3,7 +3,7 @@
 # Agent网站：xiaolinnote.com
 # 简历模版：jianli.xiaolinnote.com
 
-"""自动记忆管理器（对齐 Go 版 memory.Manager + memdir + paths）。
+"""自动记忆管理器。
 
 使用独立 .md 文件 + frontmatter + MEMORY.md 索引的存储格式，
 替代旧版集中式 memories.md。每条记忆存为一个文件，MEMORY.md
@@ -26,7 +26,7 @@ from mewcode.conversation import ConversationManager, Message
 # 记忆索引文件名
 ENTRYPOINT_NAME = "MEMORY.md"
 
-# 四种记忆类型（对齐 Go 版 MemoryType）
+# 四种记忆类型
 VALID_TYPES = {"user", "feedback", "project", "reference"}
 
 # 记忆类型到存储目录的路由：user/feedback → 用户级，project/reference → 项目级
@@ -42,7 +42,7 @@ _FRONTMATTER_RE = re.compile(r"\A---\s*\n(.*?)\n---\s*\n", re.DOTALL)
 
 
 # ---------------------------------------------------------------------------
-# 路径工具函数（对齐 Go 版 paths.go）
+# 路径工具函数
 # ---------------------------------------------------------------------------
 
 def get_auto_mem_path(project_root: str) -> str:
@@ -92,7 +92,7 @@ def ensure_memory_dir_exists(memory_dir: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Frontmatter 解析（对齐 Go 版 parseFrontmatter）
+# Frontmatter 解析
 # ---------------------------------------------------------------------------
 
 @dataclass
@@ -135,11 +135,30 @@ def parse_frontmatter(content: str) -> MemoryFile:
 
 
 # ---------------------------------------------------------------------------
-# MEMORY.md 截断（对齐 Go 版 TruncateEntrypointContent）
+# MEMORY.md 截断
 # ---------------------------------------------------------------------------
 
+def _cut_to_bytes(data: bytes, limit: int) -> str:
+    """把 UTF-8 字节串截到 limit 字节以内再解码回字符串。
+
+    优先切在 limit 之前的最后一个换行处，这样留下的都是完整条目。UTF-8 里 ASCII
+    字节不会出现在多字节字符内部，直接按字节找 b"\\n" 是安全的。
+
+    整段没有换行时按字节硬切，errors="ignore" 丢掉末尾被劈开的半个字符，
+    避免解码出替换符污染索引。
+    """
+    nl = data.rfind(b"\n", 0, limit)
+    if nl > 0:
+        return data[:nl].decode("utf-8")
+    return data[:limit].decode("utf-8", errors="ignore")
+
+
 def truncate_entrypoint_content(raw: str) -> str:
-    """截断 MEMORY.md 内容，超过行数或字节限制时添加警告。"""
+    """截断 MEMORY.md 内容，超过行数或字节限制时添加警告。
+
+    先按行截断，行是索引的天然边界。行截断之后再量字节，因为单行可以很长，
+    200 行仍然可能超出字节上限，中文条目尤其容易，一个汉字占三字节。
+    """
     trimmed = raw.strip()
     lines = trimmed.split("\n")
     line_count = len(lines)
@@ -157,11 +176,7 @@ def truncate_entrypoint_content(raw: str) -> str:
 
     result_bytes = result.encode("utf-8")
     if len(result_bytes) > MAX_ENTRYPOINT_BYTES:
-        cut = result[:MAX_ENTRYPOINT_BYTES].rfind("\n")
-        if cut > 0:
-            result = result[:cut]
-        else:
-            result = result[:MAX_ENTRYPOINT_BYTES]
+        result = _cut_to_bytes(result_bytes, MAX_ENTRYPOINT_BYTES)
 
     # 构建警告信息
     if over_bytes and not over_lines:
@@ -189,13 +204,13 @@ def _format_size(byte_count: int) -> str:
 
 
 # ---------------------------------------------------------------------------
-# 构建记忆系统提示（对齐 Go 版 BuildMemoryPrompt）
+# 构建记忆系统提示
 # ---------------------------------------------------------------------------
 
 def build_memory_prompt(user_mem_dir: str, project_mem_dir: str) -> str:
     """构建记忆系统提示，包含行为指令和 MEMORY.md 索引内容。
 
-    对齐 Go 版 BuildMemoryPrompt：组合类型化记忆行为指令 + 两个 MEMORY.md
+    组合类型化记忆行为指令 + 两个 MEMORY.md
     的内容，生成完整的 '# auto memory' 系统提示段。
     """
     lines = _build_memory_lines(user_mem_dir, project_mem_dir)
@@ -292,13 +307,13 @@ def _build_memory_lines(user_mem_dir: str, project_mem_dir: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# MemoryManager（对齐 Go 版 Manager）
+# MemoryManager
 # ---------------------------------------------------------------------------
 
 class MemoryManager:
     """管理双路径自动记忆目录（用户级 + 项目级）。
 
-    对齐 Go 版 memory.Manager：使用独立 .md 文件 + frontmatter + MEMORY.md 索引。
+    使用独立 .md 文件 + frontmatter + MEMORY.md 索引。
     实际的写入/读取通过 agent 的 Write/Read 工具完成（参考架构），
     此类提供系统提示构建和 /memory 斜杠命令支持。
     """
@@ -335,7 +350,7 @@ class MemoryManager:
         return Path(self._mem_dir.rstrip(os.sep))
 
     def load(self) -> str:
-        """构建完整的记忆系统提示（对齐 Go 版 BuildSystemReminder）。
+        """构建完整的记忆系统提示。
 
         确保两个目录存在后，返回包含行为指令和 MEMORY.md 索引内容的
         '# auto memory' 段，用于注入系统提示。
@@ -352,7 +367,7 @@ class MemoryManager:
     def load_all(self) -> list[MemoryFile]:
         """扫描两个目录中所有 .md 文件（排除 MEMORY.md），解析 frontmatter。
 
-        对齐 Go 版 LoadAll：用户级文件在前，项目级在后。
+        用户级文件在前，项目级在后。
         """
         result = _load_dir(self._user_mem_dir)
         result.extend(_load_dir(self._mem_dir))
@@ -361,7 +376,7 @@ class MemoryManager:
     def get_memories(self) -> list[str]:
         """返回所有记忆文件的单行摘要，用于 /memory list。
 
-        对齐 Go 版 GetMemories。
+        收集两类记忆目录下所有可解析的 .md 记忆。
         """
         files = self.load_all()
         out: list[str] = []
@@ -398,7 +413,7 @@ class MemoryManager:
         conversation: ConversationManager,
         protocol: str,
     ) -> None:
-        """触发记忆提取（参照 Go 版 extractor.go）。
+        """触发记忆提取。
 
         使用裸 LLM 调用 + 结构化输出解析，发送已有记忆 manifest 做去重。
         """
@@ -501,7 +516,7 @@ class MemoryManager:
                 pass
 
     def clear(self) -> None:
-        """清除两个目录中所有 .md 文件（对齐 Go 版 Clear）。"""
+        """清除两个目录下所有 .md 文件。"""
         _clear_dir(self._user_mem_dir)
         _clear_dir(self._mem_dir)
 

@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from typing import Any, AsyncIterator
 from unittest.mock import patch
 
@@ -253,7 +254,8 @@ class TestCommandExecutor:
     async def test_timeout(self):
         from mewcode.hooks.executors import execute_command
 
-        action = Action(type="command", command="sleep 10", timeout=1)
+        cmd = "ping -n 11 127.0.0.1 >nul" if os.name == "nt" else "sleep 10"
+        action = Action(type="command", command=cmd, timeout=1)
         ctx = HookContext()
         result = await execute_command(action, ctx)
         assert result.success is False
@@ -511,6 +513,7 @@ class TestAgentHookIntegration:
     """验证 pre_tool_use 拒绝会导致工具调用被跳过。"""
 
     @pytest.mark.asyncio
+    @pytest.mark.skipif(os.name == "nt", reason="rm 命令在 Windows 上不可用")
     async def test_pre_tool_use_reject_skips_tool(self):
         from mewcode.agent import Agent, ToolResultEvent
         from mewcode.client import LLMClient

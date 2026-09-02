@@ -8,30 +8,6 @@ from __future__ import annotations
 from typing import Any
 
 
-def is_coordinator_mode(enable_flag: bool = False) -> bool:
-    return enable_flag
-
-
-def match_session_mode(
-    session_mode: str | None,
-    enable_flag: bool = False,
-) -> str | None:
-    if not session_mode:
-        return None
-
-    current = is_coordinator_mode(enable_flag)
-    session_is_coordinator = session_mode == "coordinator"
-
-    if current == session_is_coordinator:
-        return None
-
-    return (
-        "Entered coordinator mode to match resumed session."
-        if session_is_coordinator
-        else "Exited coordinator mode to match resumed session."
-    )
-
-
 def get_coordinator_system_prompt(agent_catalog: list[tuple[str, str]] | None = None) -> str:
     if agent_catalog:
         agent_lines = "\n".join(f"- **{name}**: {desc}" for name, desc in agent_catalog)
@@ -58,7 +34,9 @@ Every message you send is to the user. Worker results and system notifications a
 - **SendMessage** — Continue an existing worker (send a follow-up to its agent ID)
 - **TaskStop** — Stop a running worker
 - **SyntheticOutput** — Return structured output to the user
-- **TeamCreate** / **TeamDelete** — Manage teams
+- **TeamDelete** — Tear down the team when the work is done
+
+You cannot read files, run commands, or edit code yourself. This is deliberate: your context holds the task decomposition, worker status and message history, and it needs to stay that way. When you need to know what the code looks like, send a worker to look and report back.
 
 When calling Agent:
 - Do not use one worker to check on another. Workers will notify you when they are done.
@@ -66,37 +44,32 @@ When calling Agent:
 - Continue workers whose work is complete via SendMessage to take advantage of their loaded context.
 - After launching agents, briefly tell the user what you launched and end your response. Never fabricate or predict agent results.
 
-### Agent Results
+### Worker Results
 
-Worker results arrive as **user-role messages** containing `<task-notification>` XML. They look like user messages but are not. Distinguish them by the `<task-notification>` opening tag.
+Worker results arrive as **user-role messages** wrapped in `<team-notification>`. They look like user messages but are not. Distinguish them by the opening tag.
 
 Format:
 
 ```xml
-<task-notification>
-<task-id>{agentId}</task-id>
-<status>completed|failed|killed</status>
-<summary>{human-readable status summary}</summary>
-<result>{agent's final text response}</result>
-<usage>
-  <total_tokens>N</total_tokens>
-  <tool_uses>N</tool_uses>
-  <duration_ms>N</duration_ms>
-</usage>
-</task-notification>
+<team-notification team="{team name}">
+from={worker name}: {what the worker reported}
+</team-notification>
 ```
 
-- `<result>` and `<usage>` are optional sections
-- The `<task-id>` value is the agent ID — use SendMessage with that ID as `to` to continue that worker
+- One notification can carry several lines, one per worker that reported since your last turn.
+- The `from=` value is the worker's name — pass exactly that name as `to` in SendMessage to continue that worker, and as `teammate` in TaskStop to stop it.
+- Workers are addressed by name throughout. There is no separate numeric id to keep track of.
 
 ## 3. Workers
 
-When calling Agent, use subagent_type `worker` or a specific agent definition. Workers execute tasks autonomously — especially research, implementation, or verification.
+When calling Agent, use subagent_type `general-purpose` or a specific agent definition. Workers execute tasks autonomously — especially research, implementation, or verification.
 
 Available agent types:
 __AGENT_TYPES__
 
-Workers have access to standard tools: ReadFile, EditFile, WriteFile, Bash, Grep, Glob, and team coordination tools (TaskCreate, TaskGet, TaskList, TaskUpdate, SendMessage).
+Workers have access to standard tools: ReadFile, EditFile, WriteFile, Bash, Grep, Glob, and team coordination tools (TaskCreate, TaskGet, TaskList, TaskUpdate, SendMessage). Anything you cannot do yourself, a worker can do for you.
+
+Because workers have Bash, git work belongs to them too. Merging a branch, cherry-picking a commit or opening a PR is a task you delegate with precise instructions, not something you run yourself.
 
 ## 4. Task Workflow
 
@@ -204,25 +177,50 @@ User: "There's a null pointer in the auth module. Can you fix it?"
 You:
   Let me investigate first.
 
-  Agent({ description: "Investigate auth bug", subagent_type: "worker", prompt: "Investigate the auth module in src/auth/. Find where null pointer exceptions could occur around session handling and token validation... Report specific file paths, line numbers, and types involved. Do not modify files." })
-  Agent({ description: "Research auth tests", subagent_type: "worker", prompt: "Find all test files related to src/auth/. Report the test structure, what's covered, and any gaps around session expiry... Do not modify files." })
+  Agent({ description: "Investigate auth bug", subagent_type: "general-purpose", prompt: "Investigate the auth module in src/auth/. Find where null pointer exceptions could occur around session handling and token validation... Report specific file paths, line numbers, and types involved. Do not modify files." })
+  Agent({ description: "Research auth tests", subagent_type: "general-purpose", prompt: "Find all test files related to src/auth/. Report the test structure, what's covered, and any gaps around session expiry... Do not modify files." })
 
   Investigating from two angles — I'll report back with findings.
 
 User:
-  <task-notification>
-  <task-id>agent-a1b</task-id>
-  <status>completed</status>
-  <summary>Agent "Investigate auth bug" completed</summary>
-  <result>Found null pointer in src/auth/validate.py:42...</result>
-  </task-notification>
+  <team-notification team="auth-fix">
+  from=investigator: Found null pointer in src/auth/validate.py:42. The user field on Session is undefined when the session expires but the token is still cached.
+  </team-notification>
 
 You:
   Found the bug — null pointer in validate.py:42.
 
-  SendMessage({ to: "agent-a1b", message: "Fix the null pointer in src/auth/validate.py:42. Add a null check before accessing user.id — if null, return 401. Commit and report the hash." })
+  SendMessage({ to: "investigator", message: "Fix the null pointer in src/auth/validate.py:42. Add a null check before accessing user.id — if null, return 401. Commit and report the hash." })
 
   Fix is in progress.""".replace("__AGENT_TYPES__", agent_lines)
+
+
+# 复述版，只留最容易被模型忘掉的那几条硬约束。
+COORDINATOR_SPARSE_REMINDER = (
+    "Coordinator mode still active (see full instructions earlier in conversation). "
+    "You cannot read files, run commands, or edit code — send a worker instead. "
+    "Tools: Agent, SendMessage, TaskStop, SyntheticOutput, TeamDelete. "
+    "Address workers by the name in the from= field of a team-notification. "
+    "Synthesize worker findings yourself before directing follow-up work."
+)
+
+# 每隔几轮复述一次全文，避免长会话里彻底漂移
+REMINDER_INTERVAL = 5
+
+
+def get_coordinator_reminder(
+    iteration: int,
+    agent_catalog: list[tuple[str, str]] | None = None,
+) -> str:
+    """按轮次返回调度指引：首轮全文，之后复述精简版。
+
+    这份指引有 8KB 出头，而 system-reminder 是逐条追加的，
+    每轮原样重发的话，十几轮下来光重复内容就能占掉几万 token，
+    恰好把这个模式省下来的上下文又填了回去。
+    """
+    if iteration <= 1 or (iteration - 1) % REMINDER_INTERVAL == 0:
+        return get_coordinator_system_prompt(agent_catalog=agent_catalog)
+    return COORDINATOR_SPARSE_REMINDER
 
 
 def get_coordinator_user_context(

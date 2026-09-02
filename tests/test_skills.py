@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 import textwrap
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -91,6 +91,24 @@ class TestParseSkillFile:
         assert skill.description == "A test skill"
         assert skill.mode == "inline"
         assert "$ARGUMENTS" in skill.prompt_body
+
+    def test_legacy_context_fork_maps_to_mode(self, tmp_path: Path) -> None:
+        """`context: fork` 与 `mode: fork` 等价，外部生态的技能直接可用。"""
+        f = tmp_path / "audit.md"
+        f.write_text(
+            "---\nname: audit-deps\ndescription: Audit dependencies\ncontext: fork\n---\nbody"
+        )
+        skill = parse_skill_file(f)
+        assert skill.mode == "fork"
+        assert skill.context == "full"
+
+    def test_explicit_mode_wins_over_context(self, tmp_path: Path) -> None:
+        f = tmp_path / "audit.md"
+        f.write_text(
+            "---\nname: audit-deps\ndescription: Audit\nmode: inline\ncontext: fork\n---\nbody"
+        )
+        skill = parse_skill_file(f)
+        assert skill.mode == "inline"
 
     def test_missing_name(self, tmp_path: Path) -> None:
         f = tmp_path / "bad.md"
@@ -345,11 +363,89 @@ class TestLoadSkillTool:
         assert result.is_error
         assert "not properly initialized" in result.output
 
-    def test_is_system_tool(self) -> None:
+    @pytest.mark.asyncio
+    async def test_fork_skill_runs_in_sub_agent(self) -> None:
+        """fork 模式下 SOP 正文交给子 Agent，主对话只拿到最终结果。"""
+        from mewcode.tools.load_skill import LoadSkill, LoadSkillParams
+
+        tool = LoadSkill()
+        loader = MagicMock()
+        agent = MagicMock()
+        executor = MagicMock()
+        executor.execute_fork = AsyncMock(return_value="3 risky pins found")
+
+        loader.get.return_value = SkillDef(
+            name="audit-deps",
+            description="Audit dependencies",
+            prompt_body="Inspect pyproject.toml and flag risky pins.",
+            mode="fork",
+        )
+
+        tool.set_loader(loader)
+        tool.set_agent(agent)
+        tool.set_executor(executor)
+
+        result = await tool.execute(LoadSkillParams(name="audit-deps"))
+        assert not result.is_error
+        assert result.output == "3 risky pins found"
+        assert "Inspect pyproject.toml" not in result.output
+        executor.execute_fork.assert_awaited_once()
+        agent.activate_skill.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_fork_skill_falls_back_without_executor(self) -> None:
+        """宿主没有接入执行器时回退成 inline，工具仍然可用。"""
+        from mewcode.tools.load_skill import LoadSkill, LoadSkillParams
+
+        tool = LoadSkill()
+        loader = MagicMock()
+        agent = MagicMock()
+
+        loader.get.return_value = SkillDef(
+            name="audit-deps",
+            description="Audit dependencies",
+            prompt_body="Inspect pyproject.toml and flag risky pins.",
+            mode="fork",
+        )
+
+        tool.set_loader(loader)
+        tool.set_agent(agent)
+
+        result = await tool.execute(LoadSkillParams(name="audit-deps"))
+        assert not result.is_error
+        assert "Inspect pyproject.toml" in result.output
+        agent.activate_skill.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_inline_skill_does_not_fork(self) -> None:
+        """inline 模式保持原样：返回 SOP 正文，不启子 Agent。"""
+        from mewcode.tools.load_skill import LoadSkill, LoadSkillParams
+
+        tool = LoadSkill()
+        loader = MagicMock()
+        agent = MagicMock()
+        executor = MagicMock()
+        executor.execute_fork = AsyncMock(return_value="should not be used")
+
+        loader.get.return_value = SkillDef(
+            name="commit",
+            description="Commit",
+            prompt_body="Write a conventional commit message.",
+            mode="inline",
+        )
+
+        tool.set_loader(loader)
+        tool.set_agent(agent)
+        tool.set_executor(executor)
+
+        result = await tool.execute(LoadSkillParams(name="commit"))
+        assert "Write a conventional commit message." in result.output
+        executor.execute_fork.assert_not_awaited()
+
+    def test_load_skill_is_read_only(self) -> None:
         from mewcode.tools.load_skill import LoadSkill
 
         tool = LoadSkill()
-        assert tool.is_system_tool is True
         assert tool.category == "read"
 
 # ---------------------------------------------------------------------------

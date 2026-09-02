@@ -21,6 +21,9 @@ class ToolResultBlock:
     tool_use_id: str
     content: str
     is_error: bool = False
+    # 结构化 content block；填了就用它替代 content 发出去（见 serialization.py）。
+    # content 里仍保留等价文本，token 估算和 TUI 展示都走它。
+    content_blocks: list[dict[str, Any]] | None = None
 
 
 @dataclass
@@ -140,6 +143,18 @@ class ConversationManager:
             )
         )
 
+    def has_reminder_containing(self, marker: str) -> bool:
+        """历史里还有没有包含 marker 的提醒。
+
+        用来判断一条「只需要说一次」的提醒是否还在上下文里。compact 会把历史压
+        成摘要，原来那条提醒随之消失，这时候必须重发，否则模型再也看不到。调用方
+        拿这个结果决定重发，就不用在 compact 那边额外挂钩子。
+        """
+        return any(
+            msg.role == "user" and marker in (msg.content or "")
+            for msg in self.history
+        )
+
     def add_tool_results_message(self, tool_results: list[ToolResultBlock]) -> None:
         self.history.append(
             Message(role="user", content="", tool_results=tool_results)
@@ -152,7 +167,7 @@ class ConversationManager:
             self.env_injected = True
 
     def inject_long_term_memory(
-        self, instructions: str, memories: str
+        self, instructions: str, memories: str, skills: str = ""
     ) -> None:
         if self.ltm_injected:
             return
@@ -167,6 +182,10 @@ class ConversationManager:
             )
         if memories:
             sections.append("# autoMemory\n" + memories)
+        # Skill 清单跟着项目走，放系统提示词会让每个项目各有一份、跨项目缓存全失效，
+        # 所以和指令、记忆一样放在这条消息里
+        if skills:
+            sections.append("# availableSkills\n" + skills)
         if not sections:
             return
         from datetime import date

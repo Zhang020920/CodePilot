@@ -10,7 +10,12 @@ from pathlib import Path
 
 import yaml
 
-from mewcode.skills.parser import SkillDef, SkillParseError, parse_skill_file
+from mewcode.skills.parser import (
+    SkillDef,
+    SkillParseError,
+    resolve_mode_and_context,
+    parse_skill_file,
+)
 
 log = logging.getLogger(__name__)
 
@@ -61,7 +66,7 @@ class SkillLoader:
                     skill.source_path = entry
                     results.append(skill)
                 elif entry.is_dir():
-                    # 优先尝试 skill.yaml + prompt.md 格式（对齐 Go 版）
+                    # 优先尝试 skill.yaml + prompt.md 格式
                     skill_yaml = entry / "skill.yaml"
                     if skill_yaml.is_file():
                         skill = self._parse_skill_yaml(skill_yaml, entry)
@@ -82,7 +87,7 @@ class SkillLoader:
 
     @staticmethod
     def _parse_skill_yaml(yaml_path: Path, skill_dir: Path) -> SkillDef | None:
-        """解析 skill.yaml + prompt.md 格式的 skill（对齐 Go 版 parseFrontmatterOnly + loadSkillBody）。"""
+        """解析 skill.yaml + prompt.md 格式的 skill。"""
         try:
             data = yaml_path.read_text(encoding="utf-8")
             meta = yaml.safe_load(data)
@@ -118,7 +123,7 @@ class SkillLoader:
                     description = line
                     break
 
-        mode = meta.get("mode", "inline")
+        mode, context = resolve_mode_and_context(meta)
         if mode not in ("inline", "fork"):
             mode = "inline"
 
@@ -128,7 +133,7 @@ class SkillLoader:
             prompt_body=prompt_body,
             mode=mode,
             model=meta.get("model"),
-            context=meta.get("context", "full"),
+            context=context,
             source_path=prompt_md if prompt_md.is_file() else yaml_path,
             is_directory=True,
         )

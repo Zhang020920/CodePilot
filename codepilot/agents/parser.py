@@ -14,8 +14,8 @@ from mewcode.memory.instructions import process_includes
 
 log = logging.getLogger(__name__)
 
-# 不再限制白名单——第三方模型名称（如 "glm-5.1"）需要能直通（对齐 Go 版：
-# "actual availability is left to the host's ModelResolver / LLM router"）
+# 不限制模型白名单：第三方模型名称（如 "glm-5.1"）需要能直通路由层，
+# 实际可用性由 ModelResolver / LLM 路由决定
 VALID_MODELS: set[str] | None = None  # None 表示接受任意非空字符串
 VALID_PERMISSION_MODES = {"default", "acceptEdits", "bypassPermissions", ""}
 
@@ -35,7 +35,7 @@ class AgentDef:
     tools: list[str] = field(default_factory=list)
     disallowed_tools: list[str] = field(default_factory=list)
     model: str = "inherit"
-    max_turns: int = 200  # 对齐 Go 默认值
+    max_turns: int = 200  # 未指定时的默认值
     permission_mode: str = "default"
     background: bool = False
     isolation: str = ""
@@ -111,7 +111,7 @@ def parse_agent_file(path: Path) -> AgentDef:
     meta, body = parse_frontmatter(raw)
     _validate_agent_meta(meta, str(path))
 
-    # 展开 @include 指令（围栏代码块内的 @include 会自动跳过，
+    # 展开 @ 引用指令（围栏代码块内的 @ 引用会自动跳过，
     # 由 process_includes 的 in_code 逻辑保证）
     base_dir = path.parent
     project_root = base_dir
@@ -124,7 +124,7 @@ def parse_agent_file(path: Path) -> AgentDef:
         tools=meta.get("tools", []),
         disallowed_tools=meta.get("disallowedTools", []),
         model=str(meta.get("model", "inherit")),
-        max_turns=meta.get("maxTurns") or 200,  # 对齐 Go：未指定时默认 200
+        max_turns=meta.get("maxTurns") or 200,  # 未指定时默认 200
         permission_mode=str(meta.get("permissionMode", "default")),
         background=bool(meta.get("background", False)),
         isolation=str(meta.get("isolation", "")),

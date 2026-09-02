@@ -13,7 +13,6 @@ from pydantic import BaseModel, Field
 from mewcode.tools.base import Tool, ToolResult
 
 if TYPE_CHECKING:
-    from mewcode.cache import FileCache
     from mewcode.tools.file_state_cache import FileStateCache
 
 
@@ -32,8 +31,7 @@ class WriteFile(Tool):
     category = "write"
 
 
-    def __init__(self, file_cache: FileCache | None = None, file_history: Any = None, file_state_cache: FileStateCache | None = None) -> None:
-        self._cache = file_cache
+    def __init__(self, file_history: Any = None, file_state_cache: FileStateCache | None = None) -> None:
         self.file_history = file_history
         self._state_cache = file_state_cache
 
@@ -53,8 +51,6 @@ class WriteFile(Tool):
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(params.content, encoding="utf-8")
-            if self._cache:
-                self._cache.invalidate(str(path.resolve()))
             if self._state_cache:
                 self._state_cache.update(str(path.resolve()))
         except Exception as e:

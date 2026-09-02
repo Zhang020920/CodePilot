@@ -142,7 +142,7 @@ class AppConfig:
     permission_mode: str = "default"
     mcp_servers: list[MCPServerConfig] = field(default_factory=list)
     raw_hooks: list[dict] = field(default_factory=list)
-    enable_fork: bool = False
+    enable_fork: bool = True
     enable_verification_agent: bool = False
     worktree: WorktreeConfig = field(default_factory=WorktreeConfig)
     teammate_mode: str = ""
@@ -228,8 +228,9 @@ def _merge_config(base: AppConfig, override: AppConfig) -> AppConfig:
                 by_name[s.name] = len(base.mcp_servers) - 1
 
     base.raw_hooks.extend(override.raw_hooks)
-    if override.enable_fork:
-        base.enable_fork = True
+    # enable_fork 默认开着，所以这里不能用「非零即覆盖」那套写法，
+    # 否则配置里写 false 会被当成没写，永远关不掉。
+    base.enable_fork = override.enable_fork
     if override.enable_verification_agent:
         base.enable_verification_agent = True
     if override.teammate_mode:

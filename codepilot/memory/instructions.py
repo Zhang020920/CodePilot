@@ -12,31 +12,24 @@ MAX_INCLUDE_DEPTH = 5
 
 
 # ---------------------------------------------------------------------------
-# @include 指令格式（对齐 Go 版）
+# @ 引用指令格式
 # ---------------------------------------------------------------------------
 # 支持以下格式：
 #   @./relative/path  @../relative/path  @~/home/path  @/absolute/path
-# 其他 @-token（如 @username）被忽略，不视为 include 指令。
-# 旧的 "@include path" 格式仍保留兼容。
+# 其他 @-token（如 @username）被忽略，不视为引用指令。
 
 
 def _parse_include(trimmed: str) -> str:
-    """解析一行文本，提取 @include 路径。
+    """解析一行文本，提取 @ 引用路径。
 
-    对齐 Go 版 parseInclude：支持 @./path @../path @~/path @/path 语法，
-    以及旧格式 "@include path"。返回空字符串表示该行不是 include 指令。
+    支持 @./path @../path @~/path @/path 语法。
+    返回空字符串表示该行不是引用指令。
     """
-    # 旧格式兼容：@include <path>
-    if trimmed.startswith("@include "):
-        return trimmed[len("@include "):].strip()
-
-    # 新格式：@./path, @../path, @~/path, @/abs/path
     if not trimmed.startswith("@") or trimmed.startswith("@@"):
         return ""
-    rest = trimmed[1:]  # 去掉 @
+    rest = trimmed[1:]
     if not rest:
         return ""
-    # 包含空白字符则不是 include 指令（如 @username 等普通文本）
     if " " in rest or "\t" in rest:
         return ""
     if rest.startswith("./") or rest.startswith("../") or rest.startswith("~/") or rest.startswith("/"):
@@ -47,7 +40,7 @@ def _parse_include(trimmed: str) -> str:
 def _resolve_include(path: str, base_dir: Path) -> Path:
     """将 include 路径解析为绝对路径。
 
-    对齐 Go 版 resolveInclude：~/ 展开为 home，相对路径基于 base_dir 解析。
+    ~/ 展开为 home，相对路径基于 base_dir 解析。
     """
     if path.startswith("~/"):
         return Path.home() / path[2:]
@@ -63,10 +56,10 @@ def process_includes(
     depth: int = 0,
     seen: set[str] | None = None,
 ) -> str:
-    """展开 @include 指令，对齐 Go 版 expandIncludes。
+    """展开 @ 引用指令。
 
     - 循环检测：通过 seen 集合记录已包含文件的绝对路径，防止 A→B→A 无限递归
-    - 代码块跳过：``` 围栏代码块内的 @include 不展开
+    - 代码块跳过：``` 围栏代码块内的 @ 引用不展开
     - 深度限制：最多递归 MAX_INCLUDE_DEPTH 层
     """
     if depth > MAX_INCLUDE_DEPTH:
@@ -105,7 +98,7 @@ def process_includes(
                     continue
 
                 if not resolved.exists() or not resolved.is_file():
-                    result.append("<!-- @include skipped: file not found -->")
+                    result.append("<!-- @ skipped: file not found -->")
                     continue
 
                 try:
@@ -141,7 +134,7 @@ def _find_git_root(start: Path) -> Path | None:
 
 
 def _project_instruction_dirs(work_dir: Path) -> list[Path]:
-    """返回从 git root 到 work_dir 的所有目录（对齐 Go 版 projectInstructionDirs）。
+    """返回从 git root 到 work_dir 的所有目录。
 
     如果 work_dir 不在 git 仓库内，只返回 [work_dir]。
     """
@@ -164,13 +157,13 @@ def _project_instruction_dirs(work_dir: Path) -> list[Path]:
 
 
 def load_instructions(project_root: str) -> str:
-    """发现并拼接项目和用户指令文件（对齐 Go 版 LoadInstructions）。
+    """发现并拼接项目和用户指令文件。
 
     发现顺序（低优先级在前，高优先级在后）：
     1. 用户全局：~/.mewcode/MEWCODE.md, ~/.mewcode/AGENTS.md
-    2. 项目目录链：从 git root 到 workDir，每个目录的 MEWCODE.md 和 AGENTS.md
-    3. workDir/.mewcode/INSTRUCTIONS.md（遗留格式）
-    4. workDir/MEWCODE.local.md（本地覆盖）
+    2. 项目目录链：从 git root 到 workDir，每个目录的 MEWCODE.md、AGENTS.md
+       和 .mewcode/MEWCODE.md
+    3. workDir/MEWCODE.local.md（本地覆盖）
     """
     root = Path(project_root).resolve()
     home = Path.home()
@@ -212,11 +205,10 @@ def load_instructions(project_root: str) -> str:
     for d in _project_instruction_dirs(root):
         _add(d / "MEWCODE.md")
         _add(d / "AGENTS.md")
+        # .mewcode/ 下的同名文件：想让指令进 .gitignore 的项目放这里
+        _add(d / ".mewcode" / "MEWCODE.md")
 
-    # 3. 遗留格式
-    _add(root / ".mewcode" / "INSTRUCTIONS.md")
-
-    # 4. 本地覆盖
+    # 3. 本地覆盖
     _add(root / "MEWCODE.local.md")
 
     if not sources:

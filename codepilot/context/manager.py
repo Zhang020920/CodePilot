@@ -25,7 +25,9 @@ from mewcode.serialization import build_messages
 # 常量
 # ---------------------------------------------------------------------------
 
-SINGLE_RESULT_CHAR_LIMIT = 50_000
+# 单条消息内所有工具结果的聚合上限。单条结果的大小由 tools.MAX_OUTPUT_CHARS
+# 在结果入历史时把关，这里只管聚合——一轮并行调多个工具时，每条都没超单条
+# 阈值，加起来却能撑爆上下文，这是单条阈值管不到的场景。
 AGGREGATE_CHAR_LIMIT = 200_000
 PREVIEW_CHARS = 2_000
 
@@ -35,8 +37,7 @@ AUTO_COMPACT_SAFETY_MARGIN = 13_000
 # 硬触发安全边距：effectiveWindow − 3K 为强制压缩触发线，绕过熔断器
 MANUAL_COMPACT_SAFETY_MARGIN = 3_000
 
-# Layer 2 "保留近期原文"窗口（对应 Claude Code compact.ts 的
-# buildPostCompactMessages messagesToKeep）。压缩时，尾部消息按 token 累计不超过
+# Layer 2 "保留近期原文"窗口。压缩时，尾部消息按 token 累计不超过
 # KEEP_RECENT_TOKENS、或消息数不少于 MIN_KEEP_MESSAGES（取先满足的条件保底）保留原文，
 # 不纳入摘要。累计超过 KEEP_MAX_TOKENS 时停止，防止单条超大消息吞掉整个窗口。
 KEEP_RECENT_TOKENS = 10_000
@@ -49,7 +50,6 @@ MIN_SUMMARIZE_PREFIX_TOKENS = 2_000
 
 PERSISTED_TAG = "<persisted-output>"
 
-SESSION_SUBDIR = ".mewcode/session/tool-results"
 
 
 # ---------------------------------------------------------------------------
@@ -80,97 +80,18 @@ class CompactEvent:
 
 
 # ---------------------------------------------------------------------------
-# 内容替换状态 — Design B（决策冻结，不做原地修改）
-# ---------------------------------------------------------------------------
-
-@dataclass
-class ContentReplacementState:
-    seen_ids: set[str] = field(default_factory=set)
-    replacements: dict[str, str] = field(default_factory=dict)
-
-
-@dataclass
-class ContentReplacementRecord:
-    tool_use_id: str
-    replacement: str
-    kind: str = "tool-result"
-
-
-def create_replacement_state() -> ContentReplacementState:
-    return ContentReplacementState()
-
-
-def clone_replacement_state(src: ContentReplacementState) -> ContentReplacementState:
-    return ContentReplacementState(
-        seen_ids=set(src.seen_ids),
-        replacements=dict(src.replacements),
-    )
-
-
-REPLACEMENT_RECORDS_FILENAME = "replacement_records.jsonl"
-
-
-def append_replacement_records(
-    session_dir: Path, records: list[ContentReplacementRecord]
-) -> None:
-    if not records:
-        return
-    path = session_dir / REPLACEMENT_RECORDS_FILENAME
-    with path.open("a", encoding="utf-8") as f:
-        for r in records:
-            f.write(json.dumps({
-                "kind": r.kind,
-                "tool_use_id": r.tool_use_id,
-                "replacement": r.replacement,
-            }, ensure_ascii=False) + "\n")
-
-
-def load_replacement_records(session_dir: Path) -> list[ContentReplacementRecord]:
-    path = session_dir / REPLACEMENT_RECORDS_FILENAME
-    if not path.exists():
-        return []
-    out: list[ContentReplacementRecord] = []
-    with path.open("r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            obj = json.loads(line)
-            out.append(ContentReplacementRecord(
-                kind=obj.get("kind", "tool-result"),
-                tool_use_id=obj["tool_use_id"],
-                replacement=obj["replacement"],
-            ))
-    return out
-
-
-def reconstruct_replacement_state(
-    messages: list[Message],
-    records: list[ContentReplacementRecord],
-    inherited_replacements: Mapping[str, str] | None = None,
-) -> ContentReplacementState:
-    state = create_replacement_state()
-    candidate_ids: set[str] = set()
-    for msg in messages:
-        for tr in msg.tool_results:
-            candidate_ids.add(tr.tool_use_id)
-    state.seen_ids.update(candidate_ids)
-    for r in records:
-        if r.kind == "tool-result" and r.tool_use_id in candidate_ids:
-            state.replacements[r.tool_use_id] = r.replacement
-    if inherited_replacements:
-        for tool_use_id, replacement in inherited_replacements.items():
-            if tool_use_id in candidate_ids and tool_use_id not in state.replacements:
-                state.replacements[tool_use_id] = replacement
-    return state
-
-
-# ---------------------------------------------------------------------------
 # Session 目录管理
 # ---------------------------------------------------------------------------
 
-def ensure_session_dir(work_dir: str) -> Path:
-    session_dir = Path(work_dir) / SESSION_SUBDIR
+def spill_dir(work_dir: str, session_id: str = "") -> Path:
+    """溢写目录：按会话隔离在 .mewcode/sessions/<会话id>/tool-results 下，
+    会话 id 为空（一次性调用、测试）时落到 default。"""
+    sid = session_id or "default"
+    return Path(work_dir) / ".mewcode" / "sessions" / sid / "tool-results"
+
+
+def ensure_session_dir(work_dir: str, session_id: str = "") -> Path:
+    session_dir = spill_dir(work_dir, session_id)
     session_dir.mkdir(parents=True, exist_ok=True)
     return session_dir
 
@@ -197,131 +118,75 @@ def persist_tool_result(tool_use_id: str, content: str, session_dir: Path) -> Pa
 
 
 def make_persisted_preview(content: str, file_path: Path) -> str:
-    size_kb = len(content.encode("utf-8")) // 1024
+    size_kb = len(content) // 1024
     preview = content[:PREVIEW_CHARS]
+    more = "\n..." if len(content) > PREVIEW_CHARS else ""
     return (
         f"{PERSISTED_TAG}\n"
         f"输出太大（{size_kb}KB），完整内容已保存到：\n"
         f"{file_path}\n"
         f"\n"
         f"预览（前 2KB）：\n"
-        f"{preview}\n"
+        f"{preview}{more}\n"
         f"</persisted-output>"
     )
 
 
 
 
-def _is_spill_readback(tool_use_id: str, tool_use_index: dict, abs_spill_dir: str) -> bool:
-    tu = tool_use_index.get(tool_use_id)
-    if tu is None or tu.tool_name != "ReadFile":
+def is_spill_readback(tool_name: str, arguments: Mapping[str, object], session_dir: Path) -> bool:
+    """判断一次工具调用是不是在读回溢写目录下的文件。
+
+    这类结果不做溢写：把模型刚读回来的内容再写盘换成预览，模型就永远
+    看不到全文，还会在「读回、溢写」之间打转。
+    """
+    if tool_name != "ReadFile":
         return False
-    raw = tu.arguments.get("file_path", "")
-    if not raw:
+    raw = arguments.get("file_path", "")
+    if not isinstance(raw, str) or not raw:
         return False
     abs_path = os.path.abspath(raw)
-    return abs_path.startswith(abs_spill_dir)
+    return abs_path.startswith(os.path.abspath(str(session_dir)))
 
 
 def apply_tool_result_budget(
-    conversation: ConversationManager,
+    tool_results: list[ToolResultBlock],
     session_dir: Path,
-    state: ContentReplacementState,
-) -> list[ContentReplacementRecord]:
+    exempt_ids: set[str] | None = None,
+) -> None:
+    """在一轮工具结果进入对话历史之前执行聚合预算。
+
+    整批结果的总字符数超过 AGGREGATE_CHAR_LIMIT 时，从最大的开始逐条
+    溢写到磁盘、就地替换成预览，直到总量回到限额内。消息进历史前处理完，
+    历史里的内容自此不再改动，Prompt Cache 前缀天然稳定。
+
+    exempt_ids 里的 tool_use_id 不参与溢写：溢写文件的回读结果（再溢写
+    模型就永远看不到全文），以及本轮已经单条溢写过的结果。全是豁免项时
+    接受超额。
     """
-    Design A: 就地修改原始对话历史（匹配 Claude Code 实现）。
+    exempt = exempt_ids or set()
+    total = sum(len(tr.content) for tr in tool_results)
+    if total <= AGGREGATE_CHAR_LIMIT:
+        return
 
-    直接修改 conversation.history 中消息的 ToolResultBlock.content，
-    对超限的 tool result 替换为落盘预览文本。
-
-    state 会被 mutate：本轮新决定的 id 进入 seen_ids，新决定替换的 id 进入 replacements。
-
-    返回本轮新产生的替换记录列表（List[ContentReplacementRecord]）。
-    """
-    new_records: list[ContentReplacementRecord] = []
-
-    abs_spill_dir = os.path.abspath(str(session_dir))
-    tool_use_index: dict = {}
-    for msg in conversation.history:
-        for tu in msg.tool_uses:
-            tool_use_index[tu.tool_use_id] = tu
-
-    for msg in conversation.history:
-        if not msg.tool_results:
+    # 按内容长度降序挑选：先溢写最大的，回到限额内需要动的条数最少。
+    ranked = sorted(tool_results, key=lambda tr: len(tr.content), reverse=True)
+    for tr in ranked:
+        if total <= AGGREGATE_CHAR_LIMIT:
+            break
+        if tr.tool_use_id in exempt:
             continue
-
-        fresh: list[ToolResultBlock] = []
-
-        for tr in msg.tool_results:
-            if tr.tool_use_id in state.replacements:
-                # 已有历史决策：就地应用替换
-                tr.content = state.replacements[tr.tool_use_id]
-            elif tr.tool_use_id in state.seen_ids:
-                # 见过但未替换：保持原内容不动
-                pass
-            elif tr.content.startswith(PERSISTED_TAG):
-                # 已被外部（如某些工具本身）打上 persisted-output 标签 —— 视为已知决策
-                state.seen_ids.add(tr.tool_use_id)
-                state.replacements[tr.tool_use_id] = tr.content
-                new_records.append(ContentReplacementRecord(
-                    tool_use_id=tr.tool_use_id, replacement=tr.content,
-                ))
-            else:
-                fresh.append(tr)
-
-        # Pass 1：单条超限
-        persisted_p1: set[str] = set()
-        for tr in fresh:
-            if len(tr.content) > SINGLE_RESULT_CHAR_LIMIT:
-                if _is_spill_readback(tr.tool_use_id, tool_use_index, abs_spill_dir):
-                    persisted_p1.add(tr.tool_use_id)
-                    continue
-                fp = persist_tool_result(tr.tool_use_id, tr.content, session_dir)
-                preview = make_persisted_preview(tr.content, fp)
-                state.replacements[tr.tool_use_id] = preview
-                state.seen_ids.add(tr.tool_use_id)
-                new_records.append(ContentReplacementRecord(
-                    tool_use_id=tr.tool_use_id, replacement=preview,
-                ))
-                # 就地替换消息内容
-                tr.content = preview
-                persisted_p1.add(tr.tool_use_id)
-
-        # Pass 2：聚合超限
-        remaining = [tr for tr in fresh if tr.tool_use_id not in persisted_p1]
-        total = sum(
-            len(state.replacements[tr.tool_use_id]) if tr.tool_use_id in state.replacements
-            else len(tr.content)
-            for tr in msg.tool_results
-            if tr.tool_use_id not in [r.tool_use_id for r in fresh
-                                       if r.tool_use_id not in persisted_p1
-                                       and r.tool_use_id not in state.replacements]
-        ) + sum(len(tr.content) for tr in remaining)
-        # 重新简单计算：所有 tool_results 的当前内容长度之和
-        total = sum(len(tr.content) for tr in msg.tool_results)
-        if total > AGGREGATE_CHAR_LIMIT:
-            ranked = sorted(remaining, key=lambda tr: len(tr.content), reverse=True)
-            for tr in ranked:
-                if sum(len(t.content) for t in msg.tool_results) <= AGGREGATE_CHAR_LIMIT:
-                    break
-                if _is_spill_readback(tr.tool_use_id, tool_use_index, abs_spill_dir):
-                    continue
-                fp = persist_tool_result(tr.tool_use_id, tr.content, session_dir)
-                preview = make_persisted_preview(tr.content, fp)
-                state.replacements[tr.tool_use_id] = preview
-                state.seen_ids.add(tr.tool_use_id)
-                new_records.append(ContentReplacementRecord(
-                    tool_use_id=tr.tool_use_id, replacement=preview,
-                ))
-                # 就地替换消息内容
-                tr.content = preview
-
-        # 剩余未替换的 fresh 标记为"已见但未替换"
-        for tr in fresh:
-            if tr.tool_use_id not in state.replacements:
-                state.seen_ids.add(tr.tool_use_id)
-
-    return new_records
+        if len(tr.content) <= PREVIEW_CHARS:
+            # 比预览还短的结果，溢写换不回空间
+            continue
+        try:
+            fp = persist_tool_result(tr.tool_use_id, tr.content, session_dir)
+        except OSError:
+            # 写盘失败就保留原文。消息随即定型进历史，不会再有重试
+            continue
+        preview = make_persisted_preview(tr.content, fp)
+        total -= len(tr.content) - len(preview)
+        tr.content = preview
 
 
 # ---------------------------------------------------------------------------
@@ -332,10 +197,6 @@ def compute_compact_threshold(context_window: int, manual: bool = False) -> int:
     effective = context_window - SUMMARY_OUTPUT_RESERVE
     margin = MANUAL_COMPACT_SAFETY_MARGIN if manual else AUTO_COMPACT_SAFETY_MARGIN
     return effective - margin
-
-
-def should_auto_compact(last_input_tokens: int, context_window: int) -> bool:
-    return last_input_tokens >= compute_compact_threshold(context_window)
 
 
 SUMMARY_PROMPT = """\
@@ -782,7 +643,6 @@ async def auto_compact(
     recovery: RecoveryState | None = None,
     tool_schemas: list[Mapping[str, Any]] | None = None,
     transcript_path: str = "",
-    budget_messages: list[Message] | None = None,
 ) -> CompactEvent | str | None:
     # 以真实 API 用量为锚点做阈值判断：current_tokens() 返回上次计费基准
     # （input + cache_read + cache_creation + output）加上锚点之后新增消息的
@@ -793,7 +653,7 @@ async def auto_compact(
         # 手动压缩（/compact）：直接走压缩流程，不检查阈值
         pass
     else:
-        # 双阈值判断，对齐 Go ManageContext 逻辑：
+        # 双阈值判断：
         # 1) 软触发线（auto margin 13K）：低于此线不需要压缩
         soft_threshold = compute_compact_threshold(context_window, manual=False)
         if current < soft_threshold:
@@ -812,11 +672,9 @@ async def auto_compact(
 
     before_tokens = current
 
-    # 对齐 Claude Code：先应用 tool-result budget，再做 auto-compact
-    # 当调用方提前对 conversation 做了 budget 替换，把替换后的消息列表传入
-    # budget_messages，这样 keep_start 的计算和摘要构建都基于缩减后的 token
-    # 估算，让阈值判断更准确。最终仍然重写 conversation.history（原始对话）。
-    effective_history = budget_messages if budget_messages else conversation.history
+    # 历史里的工具结果在入历史时已按预算处理为终态，history 就是实际
+    # 发送量，直接基于它计算 keep_start 和构建摘要。
+    effective_history = conversation.history
 
     # 决定保留多少尾部消息原文。只有前缀 messages[:keep_start] 会被摘要；
     # messages[keep_start:] 原样保留，让模型看到近期原文而非靠有损摘要复述。

@@ -20,18 +20,14 @@ from mewcode.context import (
     CompactBoundary,
     CompactCircuitBreaker,
     CompactEvent,
-    ContentReplacementRecord,
-    ContentReplacementState,
     RecoveryState,
-    append_replacement_records,
     apply_tool_result_budget,
     auto_compact,
-    create_replacement_state,
     ensure_session_dir,
-    load_replacement_records,
-    reconstruct_replacement_state,
+    is_spill_readback,
 )
 from mewcode.conversation import ConversationManager, ToolResultBlock, ToolUseBlock
+from mewcode.conversation_pairing import REJECTED_TOOL_RESULT
 from mewcode.conversation import ThinkingBlock as ConvThinkingBlock
 from mewcode.memory.auto_memory import MemoryManager
 from mewcode.permissions import (
@@ -58,7 +54,7 @@ from mewcode.tools.base import (
 
 log = logging.getLogger(__name__)
 
-MEMORY_EXTRACTION_INTERVAL = 5
+MEMORY_EXTRACTION_INTERVAL = 1
 MAX_TOKENS_CEILING = 64000
 MAX_OUTPUT_TOKENS_RECOVERIES = 3
 
@@ -260,7 +256,6 @@ class _ToolExecResult:
     tool_name: str
     result: ToolResult
     elapsed: float
-    is_unknown: bool
 
 
 class StreamingExecutor:
@@ -289,7 +284,6 @@ class StreamingExecutor:
                     tool_name="",
                     result=ToolResult(output=f"Tool execution error: {r}", is_error=True),
                     elapsed=0.0,
-                    is_unknown=False,
                 ))
             else:
                 out.append(r)
@@ -299,6 +293,13 @@ class StreamingExecutor:
 # ---------------------------------------------------------------------------
 # Agent 主循环
 # ---------------------------------------------------------------------------
+
+# 延迟工具清单提醒的固定开头。用它在历史里回认这条提醒还在不在：compact 把历史压
+# 成摘要之后原来那条就没了，得重发一遍
+DEFERRED_REMINDER_MARKER = (
+    "The following deferred tools are available via ToolSearch."
+)
+
 
 class Agent:
     def __init__(
@@ -324,9 +325,7 @@ class Agent:
             permission_checker.mode if permission_checker else PermissionMode.DEFAULT
         )
         self.context_window = context_window
-        self.session_dir = ensure_session_dir(work_dir)
         self.compact_breaker = CompactCircuitBreaker()
-        self.replacement_state: ContentReplacementState = create_replacement_state()
         # 保存重建工作上下文所需的快照，在 Layer 2 压缩对话后使用：
         # 最近的文件读取和 skill 调用。每次 ReadFile / skill 调用时记录，
         # auto_compact 触发阈值时消费。
@@ -337,11 +336,18 @@ class Agent:
         self.memory_manager = memory_manager
         self.hook_engine = hook_engine
         self._loop_count = 0
-        # 记忆提取合并策略（对齐 Go 版 inProgress + pendingContext）：
+        # 上一次告诉模型的延迟工具清单，按字典序。跟当前清单一比就知道工具池有没有
+        # 变，没变就不重发那条提醒
+        self._announced_deferred: list[str] = []
+        # 记忆提取合并策略：_extracting 期间触发新请求会标记 _pending_extraction，
         # _extracting: 标记是否有提取正在进行
         # _pending_extraction: 提取期间又触发了新请求，标记需要尾随提取
         self._extracting = False
         self._pending_extraction = False
+        self._consolidator: MemoryConsolidator | None = None
+        if memory_manager is not None:
+            from mewcode.memory.consolidation import MemoryConsolidator
+            self._consolidator = MemoryConsolidator(work_dir)
         self.session_id: str = ""
         self.active_skills: dict[str, str] = {}
         self._skill_catalog: str = ""
@@ -350,15 +356,59 @@ class Agent:
         self.agent_id: str = uuid.uuid4().hex[:12]
         self.parent_id: str | None = None
         self.trace_id: str | None = None
-        self.coordinator_mode: bool = False
         self.team_name: str = ""
         self._team_manager: Any = None
+        # coordinator 模式的开关，由配置显式打开
+        self.enable_coordinator_mode: bool = False
         self.notification_fn: Callable[[], list[str]] | None = None
         self.file_history: Any = None
 
         # 非阻塞 memory recall：prefetch task 与主 LLM 调用并行，工具执行后注入
         self.memory_recall_task: Any | None = None
         self._memory_recall_consumed: bool = False
+
+    def _announce_deferred_tools(self, conversation: ConversationManager) -> None:
+        """把延迟工具名清单告诉模型，只在需要的时候发。
+
+        dispatch 模式下这些工具永远不会进 tools[]，必须额外告诉模型调用要走
+        mcp_call，否则它读完 schema 也不知道从哪儿调。
+
+        这条提醒是 append 进历史的，发过一次就一直在上下文里，之后每轮再发一遍只
+        是拿同样的内容占窗口：六十来个 MCP 工具一份清单五百多 token，四十轮下来
+        就是两万多。所以只在两种情况重发，池子变了（MCP 是异步连上的，服务器也
+        可能掉线重连），或者历史里那条已经被 compact 压掉了。后者靠回扫历史发现，
+        这样就不用在 compact 那边额外挂钩子。
+        """
+        deferred_names = self.registry.get_deferred_tool_names()
+        if not deferred_names:
+            return
+
+        pool_changed = deferred_names != self._announced_deferred
+        if not pool_changed and conversation.has_reminder_containing(
+            DEFERRED_REMINDER_MARKER
+        ):
+            return
+
+        from mewcode.mcp.loading_strategy import McpLoadingMode
+
+        tail = (
+            ", then invoke them with the mcp_call tool"
+            if self.registry.mcp_loading_mode is McpLoadingMode.DISPATCH
+            else " before calling them"
+        )
+        conversation.add_system_reminder(
+            DEFERRED_REMINDER_MARKER
+            + " Their schemas are NOT loaded - use ToolSearch with "
+            'query "select:<name>[,<name>...]" to load tool schemas'
+            + tail + ":\n"
+            + "\n".join(deferred_names)
+        )
+        self._announced_deferred = deferred_names
+
+    @property
+    def session_dir(self) -> Path:
+        # 溢写目录跟随当前会话 id（resume 换会话后自动指向新目录）
+        return ensure_session_dir(self.work_dir, self.session_id)
 
     @property
     def _transcript_path(self) -> str:
@@ -369,6 +419,17 @@ class Agent:
     @property
     def plan_mode(self) -> bool:
         return self.permission_mode == PermissionMode.PLAN
+
+
+    @property
+    def coordinator_mode(self) -> bool:
+        """coordinator 模式是否生效，只看配置开关。
+
+        不看团队是否存在：模式在会话中途切换会留下麻烦，已经发出去的调度指引
+        留在对话历史里撤不回来，模型会照着过期的约束继续做事。
+        配置说了算，从第一轮到最后一轮都是同一套规则。
+        """
+        return self.enable_coordinator_mode
 
     _plan_path_cache: Path | None = None
 
@@ -453,7 +514,6 @@ class Agent:
                 yield he
 
         iteration = 0
-        consecutive_unknown = 0
         max_tokens_escalated = False
         output_recoveries = 0
 
@@ -486,11 +546,7 @@ class Agent:
             hook_prompts = (
                 self.hook_engine.get_prompt_messages() if self.hook_engine else None
             )
-            system = build_system_prompt(
-                hook_prompts=hook_prompts,
-                coordinator_mode=self.coordinator_mode,
-                agent_catalog=self._agent_catalog_list or None,
-            )
+            system = build_system_prompt(hook_prompts=hook_prompts, work_dir=self.work_dir)
 
             if self.plan_mode:
                 plan_path = str(self._get_plan_path())
@@ -502,32 +558,32 @@ class Agent:
                 )
                 conversation.add_system_reminder(plan_reminder)
 
+            # Coordinator 模式：工具集被收窄的同时注入调度指引。
+            # 走 system-reminder 而不是替换系统提示词：长会话里开头那份约束会被淹没，
+            # 每轮追加一次才拉得回来，而且 Lead 仍然需要身份、环境、项目指令和记忆这些基础段落。
+            if self.coordinator_mode:
+                from mewcode.teams.coordinator import get_coordinator_reminder
+
+                conversation.add_system_reminder(
+                    get_coordinator_reminder(
+                        iteration,
+                        agent_catalog=self._agent_catalog_list or None,
+                    )
+                )
+
             if self.hook_engine:
                 for note in self.hook_engine.drain_notifications():
                     conversation.add_system_reminder(
                         f"Hook [{note.hook_id}] {note.event}: {note.output}"
                     )
 
-            deferred_names = self.registry.get_deferred_tool_names()
-            if deferred_names:
-                conversation.add_system_reminder(
-                    "The following deferred tools are available via ToolSearch. "
-                    "Their schemas are NOT loaded - use ToolSearch with "
-                    'query "select:<name>[,<name>...]" to load tool schemas before calling them:\n'
-                    + "\n".join(deferred_names)
-                )
+            self._announce_deferred_tools(conversation)
 
             tools = self.registry.get_all_schemas(self.protocol)
 
-            # Layer 1: apply tool-result budget（就地修改 conversation）
-            new_records = apply_tool_result_budget(
-                conversation, self.session_dir, self.replacement_state
-            )
-            if new_records:
-                append_replacement_records(self.session_dir, new_records)
-
             # Layer 2: 接近 context window 上限时自动 compact
-            # tool-result budget 已就地修改 conversation，直接用 conversation.history 估算
+            # Layer 1（工具结果预算）在结果入历史时已处理完，历史里的内容
+            # 就是最终大小，直接用 conversation.history 估算
             compact_result = await auto_compact(
                 conversation,
                 self.client,
@@ -550,16 +606,27 @@ class Agent:
                 conversation.inject_long_term_memory(
                     self.instructions_content, mem
                 )
-                # 压缩后重新应用 budget（就地修改）
-                apply_tool_result_budget(
-                    conversation, self.session_dir, self.replacement_state
-                )
             elif isinstance(compact_result, str):
                 yield ErrorEvent(message=compact_result)
 
             collector = StreamCollector()
+            executor = StreamingExecutor()
+            deferred_tool_calls: list[ToolCallComplete] = []
             llm_stream = self.client.stream(conversation, system=system, tools=tools)
             async for event in collector.consume(llm_stream):
+                # 流式工具执行：收到完整 tool_use 就立刻提交执行，不等整个响应结束
+                if isinstance(event, ToolUseEvent):
+                    tc = collector.response.tool_calls[-1]
+                    # 需要交互式权限确认的工具延迟到流结束后顺序执行
+                    tool = self.registry.get(tc.tool_name)
+                    needs_ask = False
+                    if tool and self.permission_checker:
+                        decision = self.permission_checker.check(tool, tc.arguments)
+                        needs_ask = decision.effect == "ask"
+                    if needs_ask:
+                        deferred_tool_calls.append(tc)
+                    else:
+                        executor.submit(self._execute_single_tool_direct(tc))
                 yield event
 
             response = collector.response
@@ -622,6 +689,10 @@ class Agent:
                     and self.memory_manager
                 ):
                     asyncio.ensure_future(self._extract_memories(conversation))
+                if self._consolidator is not None:
+                    asyncio.ensure_future(
+                        self._consolidator.maybe_run(self.client, conversation, self.protocol)
+                    )
                 if self.hook_engine:
                     ctx = self._build_hook_context("turn_end")
                     await self.hook_engine.run_hooks("turn_end", ctx)
@@ -656,128 +727,77 @@ class Agent:
                 response.cache_creation,
             )
 
+            # 溢写文件的回读结果豁免溢写：把模型刚读回来的内容再写盘换成
+            # 预览，模型就永远看不到全文，还会在「读回、溢写」之间打转
+            exempt_ids = {
+                tc.tool_id
+                for tc in response.tool_calls
+                if is_spill_readback(tc.tool_name, tc.arguments, self.session_dir)
+            }
+
+            # 收集流式执行器中已提交的工具结果（工具在 LLM 流式输出期间已开始执行）
             tool_results: list[ToolResultBlock] = []
-            batches = partition_tool_calls(response.tool_calls, self.registry)
+            streaming_results = await executor.collect_results()
 
-            for batch in batches:
-                if batch.concurrent and len(batch.calls) > 1:
-                    batch_results = await self._execute_batch_parallel(batch.calls)
-                    for br in batch_results:
-                        if br.is_unknown:
-                            consecutive_unknown += 1
-                        else:
-                            consecutive_unknown = 0
-                        content = self._maybe_persist_or_truncate(
-                            br.tool_id, br.result.output
-                        )
-                        tool_results.append(
-                            ToolResultBlock(
-                                tool_use_id=br.tool_id,
-                                content=content,
-                                is_error=br.result.is_error,
-                            )
-                        )
-                        yield ToolResultEvent(
-                            tool_id=br.tool_id,
-                            tool_name=br.tool_name,
-                            output=br.result.output,
-                            is_error=br.result.is_error,
-                            elapsed=br.elapsed,
-                        )
-                else:
-                    for tc in batch.calls:
-                        result: ToolResult | None = None
-                        elapsed = 0.0
-                        is_unknown = False
-
-                        if self.hook_engine:
-                            file_path = self._infer_file_path(tc.arguments)
-                            hook_ctx = self._build_hook_context(
-                                "pre_tool_use",
-                                tool_name=tc.tool_name,
-                                tool_args=tc.arguments,
-                                file_path=file_path,
-                            )
-                            rejection = await self.hook_engine.run_pre_tool_hooks(hook_ctx)
-                            for he in self._drain_hook_events():
-                                yield he
-                            if rejection is not None:
-                                result = ToolResult(
-                                    output=f"Hook rejected: {rejection.reason}",
-                                    is_error=True,
-                                )
-                                content = self._maybe_persist_or_truncate(
-                                    tc.tool_id, result.output
-                                )
-                                tool_results.append(
-                                    ToolResultBlock(
-                                        tool_use_id=tc.tool_id,
-                                        content=content,
-                                        is_error=True,
-                                    )
-                                )
-                                yield ToolResultEvent(
-                                    tool_id=tc.tool_id,
-                                    tool_name=tc.tool_name,
-                                    output=result.output,
-                                    is_error=True,
-                                    elapsed=0.0,
-                                )
-                                continue
-
-                        async for item in self._execute_tool(tc):
-                            if isinstance(item, PermissionRequest):
-                                yield item
-                            else:
-                                result, elapsed, is_unknown = item
-
-                        if result is None:
-                            result = ToolResult(output="Error: no result from tool", is_error=True)
-
-                        if is_unknown:
-                            consecutive_unknown += 1
-                        else:
-                            consecutive_unknown = 0
-
-                        if self.hook_engine:
-                            file_path = self._infer_file_path(tc.arguments)
-                            hook_ctx = self._build_hook_context(
-                                "post_tool_use",
-                                tool_name=tc.tool_name,
-                                tool_args=tc.arguments,
-                                file_path=file_path,
-                            )
-                            await self.hook_engine.run_hooks("post_tool_use", hook_ctx)
-                            for he in self._drain_hook_events():
-                                yield he
-
-                        content = self._maybe_persist_or_truncate(
-                            tc.tool_id, result.output
-                        )
-                        tool_results.append(
-                            ToolResultBlock(
-                                tool_use_id=tc.tool_id,
-                                content=content,
-                                is_error=result.is_error,
-                            )
-                        )
-                        yield ToolResultEvent(
-                            tool_id=tc.tool_id,
-                            tool_name=tc.tool_name,
-                            output=result.output,
-                            is_error=result.is_error,
-                            elapsed=elapsed,
-                        )
-
-            if consecutive_unknown >= 3:
-                yield ErrorEvent(
-                    message="Agent terminated: too many consecutive unknown tool calls"
+            for br in streaming_results:
+                content = self._maybe_persist_or_truncate(
+                    br.tool_id, br.result.output, exempt_ids
                 )
-                break
+                tool_results.append(
+                    ToolResultBlock(
+                        tool_use_id=br.tool_id,
+                        content=content,
+                        is_error=br.result.is_error,
+                        content_blocks=br.result.content_blocks,
+                    )
+                )
+                yield ToolResultEvent(
+                    tool_id=br.tool_id,
+                    tool_name=br.tool_name,
+                    output=br.result.output,
+                    is_error=br.result.is_error,
+                    elapsed=br.elapsed,
+                )
+
+            # 需要交互式权限确认的工具，在流结束后顺序执行
+            for tc in deferred_tool_calls:
+                result: ToolResult | None = None
+                elapsed = 0.0
+
+                async for item in self._execute_tool(tc):
+                    if isinstance(item, PermissionRequest):
+                        yield item
+                    else:
+                        result, elapsed = item
+
+                if result is None:
+                    result = ToolResult(output="Error: no result from tool", is_error=True)
+
+                content = self._maybe_persist_or_truncate(
+                    tc.tool_id, result.output, exempt_ids
+                )
+                tool_results.append(
+                    ToolResultBlock(
+                        tool_use_id=tc.tool_id,
+                        content=content,
+                        is_error=result.is_error,
+                        content_blocks=result.content_blocks,
+                    )
+                )
+                yield ToolResultEvent(
+                    tool_id=tc.tool_id,
+                    tool_name=tc.tool_name,
+                    output=result.output,
+                    is_error=result.is_error,
+                    elapsed=elapsed,
+                )
 
             exit_plan_called = any(
                 tc.tool_name == "ExitPlanMode" for tc in response.tool_calls
             )
+            # 聚合预算：一轮并行工具的结果落在同一条消息里，单条阈值管不住
+            # 合计超限的情况。进历史前把整批处理完，消息一出生就是终态
+            apply_tool_result_budget(tool_results, self.session_dir, exempt_ids)
             conversation.add_tool_results_message(tool_results)
 
             # 非阻塞 memory recall：工具执行完后检查 prefetch 是否就绪
@@ -814,9 +834,9 @@ class Agent:
             messages = mailbox.consume(self.agent_id)
             for msg in messages:
                 prefix = f"[Message from {msg.from_agent}]"
-                if msg.message_type != "text":
-                    prefix = f"[{msg.message_type} from {msg.from_agent}]"
-                content = f"{prefix} {msg.content}"
+                if msg.type != "text":
+                    prefix = f"[{msg.type} from {msg.from_agent}]"
+                content = f"{prefix} {msg.text}"
                 conversation.add_user_message(content)
         except Exception as e:
             log.debug("Mailbox consumption failed: %s", e)
@@ -832,12 +852,12 @@ class Agent:
         start = time.monotonic()
 
         if tool is None:
+            # 工具名不存在只回一条错误结果，让模型自己换个工具重来，不打断循环。
             return _ToolExecResult(
                 tool_id=tc.tool_id,
                 tool_name=tc.tool_name,
                 result=ToolResult(output=f"Error: unknown tool '{tc.tool_name}'", is_error=True),
                 elapsed=time.monotonic() - start,
-                is_unknown=True,
             )
 
         if not self.registry.is_enabled(tc.tool_name):
@@ -846,8 +866,17 @@ class Agent:
                 tool_name=tc.tool_name,
                 result=ToolResult(output=f"Error: tool '{tc.tool_name}' is disabled", is_error=True),
                 elapsed=time.monotonic() - start,
-                is_unknown=False,
             )
+
+        if self.permission_checker:
+            decision = self.permission_checker.check(tool, tc.arguments)
+            if decision.effect == "deny":
+                return _ToolExecResult(
+                    tool_id=tc.tool_id,
+                    tool_name=tc.tool_name,
+                    result=ToolResult(output=f"Permission denied: {decision.reason}", is_error=True),
+                    elapsed=time.monotonic() - start,
+                )
 
         try:
             params = tool.params_model.model_validate(tc.arguments)
@@ -864,7 +893,6 @@ class Agent:
             tool_name=tc.tool_name,
             result=result,
             elapsed=time.monotonic() - start,
-            is_unknown=False,
         )
 
 
@@ -876,18 +904,17 @@ class Agent:
 
     async def _execute_tool(
         self, tc: ToolCallComplete
-    ) -> AsyncIterator[tuple[ToolResult, float, bool]]:
+    ) -> AsyncIterator[tuple[ToolResult, float]]:
         tool = self.registry.get(tc.tool_name)
         start = time.monotonic()
-        is_unknown = False
 
         if tool is None:
+            # 工具名不存在只回一条错误结果，让模型自己换个工具重来，不打断循环。
             result = ToolResult(
                 output=f"Error: unknown tool '{tc.tool_name}'", is_error=True
             )
-            is_unknown = True
             elapsed = time.monotonic() - start
-            yield result, elapsed, is_unknown
+            yield result, elapsed
             return
 
         if not self.registry.is_enabled(tc.tool_name):
@@ -896,7 +923,7 @@ class Agent:
                 is_error=True,
             )
             elapsed = time.monotonic() - start
-            yield result, elapsed, is_unknown
+            yield result, elapsed
             return
 
         # 权限检查
@@ -909,7 +936,7 @@ class Agent:
                     is_error=True,
                 )
                 elapsed = time.monotonic() - start
-                yield result, elapsed, is_unknown
+                yield result, elapsed
                 return
 
             if decision.effect == "ask":
@@ -926,22 +953,20 @@ class Agent:
 
                 if response == PermissionResponse.DENY:
                     result = ToolResult(
-                        output="Permission denied: 用户拒绝了此操作",
+                        output=REJECTED_TOOL_RESULT,
                         is_error=True,
                     )
                     elapsed = time.monotonic() - start
-                    yield result, elapsed, is_unknown
+                    yield result, elapsed
                     return
 
                 if response == PermissionResponse.ALLOW_ALWAYS:
                     from mewcode.permissions.rules import Rule, extract_content
                     content = extract_content(tc.tool_name, tc.arguments)
                     pattern = f"{content[:60]}*" if len(content) > 60 else f"{content}*"
-                    # 持久化规则写入本地文件
+                    # 写入本地规则文件，规则引擎每次评估都现读现匹配，本轮之后即刻生效
                     rule = Rule(tool_name=tc.tool_name, pattern=pattern, effect="allow")
                     self.permission_checker.rule_engine.append_local_rule(rule)
-                    # 同时加入会话级放行集合，本轮立即生效无需磁盘读取
-                    self.permission_checker.add_session_allow(tc.tool_name, content)
 
         try:
             params = tool.params_model.model_validate(tc.arguments)
@@ -958,7 +983,7 @@ class Agent:
         self._snapshot_for_recovery(tc, result)
 
         elapsed = time.monotonic() - start
-        yield result, elapsed, is_unknown
+        yield result, elapsed
 
     def _snapshot_for_recovery(
         self, tc: ToolCallComplete, result: ToolResult
@@ -982,7 +1007,7 @@ class Agent:
     async def _extract_memories(
         self, conversation: ConversationManager
     ) -> None:
-        """触发记忆提取，对齐 Go 版 inProgress + pendingContext 合并策略。
+        """触发记忆提取，合并策略见类内字段注释。
 
         当提取正在进行时，新的触发不会启动并发提取，而是标记 _pending_extraction。
         当前提取完成后检查该标志，如果有 pending 则立即执行一次尾随提取，
@@ -1072,10 +1097,7 @@ class Agent:
         hook_prompts = (
             self.hook_engine.get_prompt_messages() if self.hook_engine else None
         )
-        system = build_system_prompt(
-            hook_prompts=hook_prompts,
-            coordinator_mode=self.coordinator_mode,
-        )
+        system = build_system_prompt(hook_prompts=hook_prompts, work_dir=self.work_dir)
 
         tools = self.registry.get_all_schemas(self.protocol)
 
@@ -1103,13 +1125,6 @@ class Agent:
                 for note in self.notification_fn():
                     conversation.add_system_reminder(note)
 
-            # 对齐 Claude Code：先应用 tool-result budget（就地修改），再做 auto-compact
-            pre_compact_records = apply_tool_result_budget(
-                conversation, self.session_dir, self.replacement_state
-            )
-            if pre_compact_records:
-                append_replacement_records(self.session_dir, pre_compact_records)
-
             compact_result = await auto_compact(
                 conversation,
                 self.client,
@@ -1124,21 +1139,7 @@ class Agent:
             if isinstance(compact_result, CompactEvent):
                 conversation.inject_environment(env_context)
 
-            deferred_names = self.registry.get_deferred_tool_names()
-            if deferred_names:
-                conversation.add_system_reminder(
-                    "The following deferred tools are available via ToolSearch. "
-                    "Their schemas are NOT loaded - use ToolSearch with "
-                    'query "select:<name>[,<name>...]" to load tool schemas before calling them:\n'
-                    + "\n".join(deferred_names)
-                )
-
-            # 压缩后或追加 deferred 提示后重新应用 budget（就地修改）
-            _new_records = apply_tool_result_budget(
-                conversation, self.session_dir, self.replacement_state
-            )
-            if _new_records:
-                append_replacement_records(self.session_dir, _new_records)
+            self._announce_deferred_tools(conversation)
 
             collector = StreamCollector()
             llm_stream = self.client.stream(conversation, system=system, tools=tools)
@@ -1197,6 +1198,14 @@ class Agent:
                 response.cache_creation,
             )
 
+            # 溢写文件的回读结果豁免溢写：把模型刚读回来的内容再写盘换成
+            # 预览，模型就永远看不到全文，还会在「读回、溢写」之间打转
+            exempt_ids = {
+                tc.tool_id
+                for tc in response.tool_calls
+                if is_spill_readback(tc.tool_name, tc.arguments, self.session_dir)
+            }
+
             tool_results: list[ToolResultBlock] = []
             for tc in response.tool_calls:
                 if event_callback:
@@ -1206,15 +1215,21 @@ class Agent:
                         "args": tc.arguments,
                     })
                 result = await self._execute_tool_noninteractive(tc)
-                content = self._maybe_persist_or_truncate(tc.tool_id, result.output)
+                content = self._maybe_persist_or_truncate(
+                    tc.tool_id, result.output, exempt_ids
+                )
                 tool_results.append(
                     ToolResultBlock(
                         tool_use_id=tc.tool_id,
                         content=content,
                         is_error=result.is_error,
+                        content_blocks=result.content_blocks,
                     )
                 )
 
+            # 聚合预算：一轮并行工具的结果落在同一条消息里，单条阈值管不住
+            # 合计超限的情况。进历史前把整批处理完，消息一出生就是终态
+            apply_tool_result_budget(tool_results, self.session_dir, exempt_ids)
             conversation.add_tool_results_message(tool_results)
 
             if self.hook_engine:
@@ -1294,16 +1309,27 @@ class Agent:
 
         return result
 
-    def _maybe_persist_or_truncate(self, tool_use_id: str, text: str) -> str:
+    def _maybe_persist_or_truncate(
+        self, tool_use_id: str, text: str, exempt_ids: set[str] | None = None
+    ) -> str:
         from mewcode.context.manager import (
-            SINGLE_RESULT_CHAR_LIMIT,
             make_persisted_preview,
             persist_tool_result,
         )
 
-        if len(text) > SINGLE_RESULT_CHAR_LIMIT:
-            fp = persist_tool_result(tool_use_id, text, self.session_dir)
-            return make_persisted_preview(text, fp)
+        # 超过阈值的输出持久化到磁盘，对话里只保留预览和文件路径。
+        # 溢写文件的回读结果豁免；写盘失败会原样保留，同一块磁盘
+        # 聚合预算也不必再试，所以两种结果都标记豁免
+        if exempt_ids is not None and tool_use_id in exempt_ids:
+            return text
         if len(text) > MAX_OUTPUT_CHARS:
-            return text[:MAX_OUTPUT_CHARS] + "\n… (output truncated)"
+            try:
+                fp = persist_tool_result(tool_use_id, text, self.session_dir)
+            except OSError:
+                if exempt_ids is not None:
+                    exempt_ids.add(tool_use_id)
+                return text
+            if exempt_ids is not None:
+                exempt_ids.add(tool_use_id)
+            return make_persisted_preview(text, fp)
         return text

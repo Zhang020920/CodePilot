@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -25,17 +26,14 @@ from mewcode.memory.instructions import (
     process_includes,
 )
 from mewcode.memory.session import (
-    RecordType,
     ResumeResult,
     Session,
     SessionManager,
     SessionMeta,
     SessionRecord,
-
     make_compact_boundary,
     parse_compact_boundary,
     records_to_messages,
-    validate_message_chain,
 )
 
 # =========================================================================
@@ -51,7 +49,7 @@ class TestProcessIncludes:
     def test_basic_include(self, tmp_path: Path) -> None:
         child = tmp_path / "child.md"
         child.write_text("included content", encoding="utf-8")
-        content = "before\n@include ./child.md\nafter"
+        content = "before\n@./child.md\nafter"
         result = process_includes(content, tmp_path, tmp_path)
         assert "included content" in result
         assert "before" in result
@@ -61,8 +59,8 @@ class TestProcessIncludes:
         grandchild = tmp_path / "grandchild.md"
         grandchild.write_text("deep content", encoding="utf-8")
         child = tmp_path / "child.md"
-        child.write_text("@include ./grandchild.md", encoding="utf-8")
-        content = "@include ./child.md"
+        child.write_text("@./grandchild.md", encoding="utf-8")
+        content = "@./child.md"
         result = process_includes(content, tmp_path, tmp_path)
         assert "deep content" in result
 
@@ -72,26 +70,26 @@ class TestProcessIncludes:
         assert result == content
 
     def test_path_outside_project_not_found(self, tmp_path: Path) -> None:
-        """项目外路径对齐 Go 版：不做路径限制，不存在的文件显示 file not found。"""
-        content = "@include ../../etc/passwd"
+        """项目外路径不做限制，不存在的文件显示 file not found。"""
+        content = "@../../etc/passwd"
         result = process_includes(content, tmp_path, tmp_path)
         assert "skipped: file not found" in result
 
     def test_file_not_found(self, tmp_path: Path) -> None:
-        content = "@include ./nonexistent.md"
+        content = "@./nonexistent.md"
         result = process_includes(content, tmp_path, tmp_path)
         assert "skipped: file not found" in result
 
     def test_cycle_detection(self, tmp_path: Path) -> None:
-        """循环检测：A→B→A 不会无限递归（对齐 Go 版 seen 集合）。"""
+        """循环检测：A→B→A 不会无限递归。"""
         a = tmp_path / "a.md"
         b = tmp_path / "b.md"
-        a.write_text("start\n@include ./b.md\nend-a", encoding="utf-8")
-        b.write_text("middle\n@include ./a.md\nend-b", encoding="utf-8")
+        a.write_text("start\n@./b.md\nend-a", encoding="utf-8")
+        b.write_text("middle\n@./a.md\nend-b", encoding="utf-8")
         result = process_includes(
-            "@include ./a.md", tmp_path, tmp_path
+            "@./a.md", tmp_path, tmp_path
         )
-        # a.md 被展开，b.md 也被展开，但 b 中再次 @include a 时被跳过
+        # a.md 被展开，b.md 也被展开，但 b 中再次 @./a.md 时被跳过
         assert "start" in result
         assert "middle" in result
         assert "end-b" in result
@@ -99,18 +97,18 @@ class TestProcessIncludes:
         assert result.count("start") == 1
 
     def test_code_block_skip(self, tmp_path: Path) -> None:
-        """代码块内的 @include 不展开（对齐 Go 版 inCode 检测）。"""
+        """代码块内的 @ 引用不展开。"""
         child = tmp_path / "child.md"
         child.write_text("should not appear", encoding="utf-8")
-        content = "before\n```\n@include ./child.md\n```\nafter"
+        content = "before\n```\n@./child.md\n```\nafter"
         result = process_includes(content, tmp_path, tmp_path)
         assert "should not appear" not in result
-        assert "@include ./child.md" in result
+        assert "@./child.md" in result
         assert "before" in result
         assert "after" in result
 
     def test_new_at_syntax(self, tmp_path: Path) -> None:
-        """新格式 @./path 语法（对齐 Go 版 parseInclude）。"""
+        """新格式 @./path 语法。"""
         child = tmp_path / "child.md"
         child.write_text("new syntax content", encoding="utf-8")
         content = "before\n@./child.md\nafter"
@@ -125,17 +123,28 @@ class TestLoadInstructions:
         assert "project instructions" in result
 
     def test_multi_layer_priority(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-        """对齐 Go 版发现顺序：MEWCODE.md 在前，.mewcode/INSTRUCTIONS.md（legacy）在后。"""
+        """同一目录下 MEWCODE.md 在前，.mewcode/MEWCODE.md 在后（优先级更高）。"""
         root_md = tmp_path / "MEWCODE.md"
         root_md.write_text("root level", encoding="utf-8")
         dotdir = tmp_path / ".mewcode"
         dotdir.mkdir()
-        # Go 版不发现 .mewcode/MEWCODE.md，只发现 .mewcode/INSTRUCTIONS.md（legacy）
-        legacy_md = dotdir / "INSTRUCTIONS.md"
-        legacy_md.write_text("legacy level", encoding="utf-8")
+        dot_md = dotdir / "MEWCODE.md"
+        dot_md.write_text("dotdir level", encoding="utf-8")
         result = load_instructions(str(tmp_path))
-        assert result.index("root level") < result.index("legacy level")
+        assert result.index("root level") < result.index("dotdir level")
         assert "---" in result
+
+    def test_dotdir_walks_up(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """.mewcode/MEWCODE.md 参与逐级遍历，深层目录的排在后面。"""
+        subprocess.run(["git", "init"], cwd=tmp_path, capture_output=True)
+        sub = tmp_path / "pkg" / "deep"
+        sub.mkdir(parents=True)
+        (tmp_path / ".mewcode").mkdir(exist_ok=True)
+        (tmp_path / ".mewcode" / "MEWCODE.md").write_text("dotdir root", encoding="utf-8")
+        (sub / ".mewcode").mkdir()
+        (sub / ".mewcode" / "MEWCODE.md").write_text("dotdir leaf", encoding="utf-8")
+        result = load_instructions(str(sub))
+        assert result.index("dotdir root") < result.index("dotdir leaf")
 
     def test_no_files_returns_empty(self, tmp_path: Path) -> None:
         result = load_instructions(str(tmp_path))
@@ -150,16 +159,17 @@ class TestSessionRecord:
         msg = Message(role="user", content="hello world")
         records = SessionRecord.from_message(msg)
         assert len(records) == 1
-        assert records[0].type == RecordType.USER
+        assert records[0].role == "user"
+        assert records[0].type is None
         assert records[0].content == "hello world"
 
         line = records[0].to_jsonl()
         restored = SessionRecord.from_jsonl(line)
         assert restored is not None
-        assert restored.type == RecordType.USER
+        assert restored.role == "user"
         assert restored.content == "hello world"
 
-    def test_assistant_with_tool_uses(self) -> None:
+    def test_assistant_with_tool_uses_roundtrip(self) -> None:
         msg = Message(
             role="assistant",
             content="Let me check",
@@ -169,12 +179,18 @@ class TestSessionRecord:
         )
         records = SessionRecord.from_message(msg)
         assert len(records) == 1
-        assert records[0].type == RecordType.ASSISTANT
-        assert isinstance(records[0].content, list)
-        assert records[0].content[0]["type"] == "text"
-        assert records[0].content[1]["type"] == "tool_use"
+        # 工具块以中立命名内联在同一条记录里，正文仍在 content
+        assert records[0].content == "Let me check"
+        assert records[0].tool_uses[0]["tool_use_id"] == "t1"
+        assert records[0].tool_uses[0]["tool_name"] == "ReadFile"
+        assert records[0].tool_uses[0]["arguments"] == {"path": "/a"}
 
-    def test_tool_results_multiple_records(self) -> None:
+        restored = SessionRecord.from_jsonl(records[0].to_jsonl())
+        got = restored.to_message()
+        assert got.tool_uses[0].tool_name == "ReadFile"
+        assert got.tool_uses[0].arguments == {"path": "/a"}
+
+    def test_tool_results_inline_in_single_record(self) -> None:
         msg = Message(
             role="user",
             content="",
@@ -184,14 +200,15 @@ class TestSessionRecord:
             ],
         )
         records = SessionRecord.from_message(msg)
-        assert len(records) == 2
-        assert records[0].type == RecordType.TOOL_RESULT
-        assert records[0].tool_use_id == "t1"
-        assert records[1].is_error is True
+        assert len(records) == 1
+        assert len(records[0].tool_results) == 2
+        assert records[0].tool_results[0]["tool_use_id"] == "t1"
+        assert records[0].tool_results[1]["is_error"] is True
 
     def test_malformed_jsonl_returns_none(self) -> None:
         assert SessionRecord.from_jsonl("{bad json") is None
-        assert SessionRecord.from_jsonl('{"type":"unknown","content":"x","timestamp":"2025-01-01T00:00:00"}') is None
+        # 缺少 role 字段的行（含旧格式记录）安全跳过
+        assert SessionRecord.from_jsonl('{"type":"assistant","content":"x"}') is None
 
     def test_plain_assistant_message(self) -> None:
         msg = Message(role="assistant", content="done")
@@ -279,97 +296,52 @@ class TestSessionManager:
         s.close()
 
 # =========================================================================
-# D. 消息链校验与会话恢复
+# D. 会话恢复
 # =========================================================================
 
-class TestValidateMessageChain:
-    def test_complete_chain(self) -> None:
-        now = datetime.now(timezone.utc)
-        records = [
-            SessionRecord(type=RecordType.USER, content="hi", timestamp=now),
-            SessionRecord(
-                type=RecordType.ASSISTANT,
-                content=[
-                    {"type": "text", "text": "checking"},
-                    {"type": "tool_use", "id": "t1", "name": "ReadFile", "input": {}},
-                ],
-                timestamp=now,
-            ),
-            SessionRecord(
-                type=RecordType.TOOL_RESULT,
-                content="file content",
-                timestamp=now,
-                tool_use_id="t1",
-            ),
-            SessionRecord(type=RecordType.ASSISTANT, content="done", timestamp=now),
-        ]
-        assert validate_message_chain(records) == 4
+def _rec(role: str, content: str = "", **kw: Any) -> SessionRecord:
+    return SessionRecord(role=role, content=content, timestamp=datetime.now(timezone.utc), **kw)
 
-    def test_truncate_at_missing_tool_result(self) -> None:
-        now = datetime.now(timezone.utc)
-        records = [
-            SessionRecord(type=RecordType.USER, content="hi", timestamp=now),
-            SessionRecord(type=RecordType.ASSISTANT, content="ok", timestamp=now),
-            SessionRecord(
-                type=RecordType.ASSISTANT,
-                content=[
-                    {"type": "tool_use", "id": "t2", "name": "Bash", "input": {}},
-                ],
-                timestamp=now,
-            ),
-        ]
-        assert validate_message_chain(records) == 2
-
-    def test_empty_records(self) -> None:
-        assert validate_message_chain([]) == 0
 
 class TestRecordsToMessages:
     def test_basic_roundtrip(self) -> None:
-        now = datetime.now(timezone.utc)
-        records = [
-            SessionRecord(type=RecordType.USER, content="hello", timestamp=now),
-            SessionRecord(type=RecordType.ASSISTANT, content="world", timestamp=now),
-        ]
+        records = [_rec("user", "hello"), _rec("assistant", "world")]
         messages = records_to_messages(records)
         assert len(messages) == 2
         assert messages[0].role == "user"
         assert messages[1].role == "assistant"
 
-    def test_tool_result_grouping(self) -> None:
-        now = datetime.now(timezone.utc)
+    def test_tool_blocks_restored(self) -> None:
         records = [
-            SessionRecord(type=RecordType.USER, content="go", timestamp=now),
-            SessionRecord(
-                type=RecordType.ASSISTANT,
-                content=[
-                    {"type": "tool_use", "id": "t1", "name": "ReadFile", "input": {}},
-                    {"type": "tool_use", "id": "t2", "name": "Bash", "input": {}},
+            _rec("user", "go"),
+            _rec(
+                "assistant",
+                "checking",
+                tool_uses=[
+                    {"tool_use_id": "t1", "tool_name": "ReadFile", "arguments": {}},
+                    {"tool_use_id": "t2", "tool_name": "Bash", "arguments": {}},
                 ],
-                timestamp=now,
             ),
-            SessionRecord(
-                type=RecordType.TOOL_RESULT, content="r1", timestamp=now, tool_use_id="t1"
+            _rec(
+                "user",
+                "",
+                tool_results=[
+                    {"tool_use_id": "t1", "content": "r1"},
+                    {"tool_use_id": "t2", "content": "r2"},
+                ],
             ),
-            SessionRecord(
-                type=RecordType.TOOL_RESULT, content="r2", timestamp=now, tool_use_id="t2"
-            ),
-            SessionRecord(type=RecordType.ASSISTANT, content="done", timestamp=now),
+            _rec("assistant", "done"),
         ]
         messages = records_to_messages(records)
         assert len(messages) == 4
-        assert messages[0].role == "user"
-        assert messages[1].role == "assistant"
         assert len(messages[1].tool_uses) == 2
-        assert messages[2].role == "user"
+        assert messages[1].tool_uses[0].tool_name == "ReadFile"
         assert len(messages[2].tool_results) == 2
+        assert messages[2].tool_results[0].tool_use_id == "t1"
         assert messages[3].role == "assistant"
 
-    def test_system_prompt_skipped(self) -> None:
-        now = datetime.now(timezone.utc)
-        records = [
-            SessionRecord(type=RecordType.SYSTEM_PROMPT, content="system", timestamp=now),
-            SessionRecord(type=RecordType.USER, content="hi", timestamp=now),
-        ]
+    def test_non_conversation_role_skipped(self) -> None:
+        records = [_rec("system", "system prompt"), _rec("user", "hi")]
         messages = records_to_messages(records)
         assert len(messages) == 1
         assert messages[0].content == "hi"
@@ -394,7 +366,9 @@ class TestSessionResume:
         mgr = SessionManager(str(tmp_path))
         assert mgr.resume("nonexistent") is None
 
-    def test_resume_truncates_incomplete_chain(self, tmp_path: Path) -> None:
+    def test_resume_keeps_incomplete_chain(self, tmp_path: Path) -> None:
+        # 恢复时不截断悬空的 tool_use，完整保留历史，工具块也一并还原；
+        # 配对由发请求前的 ensure_tool_pairing 补齐。
         mgr = SessionManager(str(tmp_path))
         s = mgr.create()
         sid = s.session_id
@@ -413,7 +387,8 @@ class TestSessionResume:
 
         result = mgr.resume(sid)
         assert result is not None
-        assert len(result.messages) == 2
+        assert len(result.messages) == 3
+        assert result.messages[2].tool_uses[0].tool_use_id == "t1"
         result.session.close()
 
 # =========================================================================
@@ -427,14 +402,14 @@ class TestCompactBoundaryRoundTrip:
             Message(role="assistant", content="recent answer"),
         ]
         rec = make_compact_boundary("the summary", keep)
-        assert rec.type == RecordType.COMPACT_BOUNDARY
+        assert rec.is_compact_boundary()
         assert rec.content["summary"] == "the summary"
 
         # JSONL 往返序列化（content 是一个 dict，必须能完整地序列化/反序列化）
         line = rec.to_jsonl()
         restored = SessionRecord.from_jsonl(line)
         assert restored is not None
-        assert restored.type == RecordType.COMPACT_BOUNDARY
+        assert restored.is_compact_boundary()
 
         summary, keep_msgs = parse_compact_boundary(restored)
         assert summary == "the summary"
@@ -472,8 +447,8 @@ class TestCompactBoundaryRoundTrip:
 
     def test_parse_malformed_boundary_degrades(self) -> None:
         bad = SessionRecord(
-            type=RecordType.COMPACT_BOUNDARY, content="not a dict",
-            timestamp=datetime.now(timezone.utc),
+            role="system", content="not a dict",
+            timestamp=datetime.now(timezone.utc), type="compact_boundary",
         )
         summary, keep_msgs = parse_compact_boundary(bad)
         assert summary == ""
@@ -617,7 +592,7 @@ class TestSessionMeta:
 # =========================================================================
 
 class TestMemoryManager:
-    """对齐 Go 版 Manager：独立 .md 文件 + frontmatter + MEMORY.md 索引格式。"""
+    """Manager：独立 .md 文件 + frontmatter + MEMORY.md 索引格式。"""
 
     def test_load_returns_prompt(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         """load() 返回完整的记忆系统提示（包含行为指令），不再是空字符串。"""
@@ -779,6 +754,27 @@ class TestConversationInjection:
         assert len(conv.history) == 0
         assert conv.ltm_injected is False
 
+    def test_inject_carries_skills(self) -> None:
+        """Skill 清单跟着项目走，必须待在首条 system-reminder 里，不进 System Prompt。"""
+        conv = ConversationManager()
+        conv.inject_long_term_memory("rules", "mems", "- /pdf: fill forms")
+
+        assert len(conv.history) == 1
+        content = conv.history[0].content
+        assert "availableSkills" in content
+        assert "- /pdf: fill forms" in content
+        # 三样内容同处一条消息，位置固定，缓存前缀才稳
+        assert "rules" in content
+        assert "mems" in content
+
+    def test_inject_skills_only(self) -> None:
+        """项目可能没写 MEWCODE.md 也没有记忆，只有 Skill 时同样要注入。"""
+        conv = ConversationManager()
+        conv.inject_long_term_memory("", "", "- /review: review code")
+
+        assert len(conv.history) == 1
+        assert "- /review: review code" in conv.history[0].content
+
     def test_replace_history_resets_ltm(self) -> None:
         conv = ConversationManager()
         conv.inject_long_term_memory("rules", "mems")
@@ -792,7 +788,7 @@ class TestConversationInjection:
 
 class TestMemoryExtraction:
     def test_memory_types_aligned_with_go(self, tmp_path: Path) -> None:
-        """验证四种记忆类型与 Go 版一致。"""
+        """验证四种记忆类型枚举。"""
         from mewcode.memory.auto_memory import VALID_TYPES, _USER_LEVEL_TYPES, _PROJECT_LEVEL_TYPES
 
         assert VALID_TYPES == {"user", "feedback", "project", "reference"}

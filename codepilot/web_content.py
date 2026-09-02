@@ -4,7 +4,7 @@
 # 简历模版：jianli.xiaolinnote.com
 
 # Remote 模式的 Web 前端 HTML。
-# 从 Go 版 internal/remote/web.go 原样复制。
+# Web UI 静态 HTML。
 
 INDEX_HTML = r"""<!DOCTYPE html>
 <html lang="zh-CN">

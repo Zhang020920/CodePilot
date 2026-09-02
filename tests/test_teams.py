@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import shutil
@@ -28,12 +29,15 @@ from mewcode.teams.models import (
 from mewcode.teams.shared_task import SharedTask, SharedTaskStore
 from mewcode.teams.mailbox import Mailbox, MailboxMessage, create_message
 from mewcode.teams.registry import AgentNameRegistry
-from mewcode.teams.backend_detect import BackendDetectionError, detect_backend, detect_pane_backend
+from mewcode.teams.backend_detect import (
+    BackendDetectionError,
+    detect_backend,
+    detect_backend_from_env,
+    detect_pane_backend,
+)
 from mewcode.teams.coordinator import (
     get_coordinator_system_prompt,
     get_coordinator_user_context,
-    is_coordinator_mode,
-    match_session_mode,
 )
 from mewcode.agents.tool_filter import (
     COORDINATOR_MODE_ALLOWED_TOOLS,
@@ -57,7 +61,6 @@ class DummyTool(Tool):
         self.description = f"Dummy {name}"
         self.category = category
         self.is_concurrency_safe = True
-        self.is_system_tool = False
 
     def get_schema(self):
         return {"name": self.name, "description": self.description, "input_schema": {}}
@@ -254,12 +257,12 @@ class TestSharedTaskStore:
 class TestMailbox:
     def test_write_and_consume(self, tmp_dir):
         mailbox = Mailbox(tmp_dir)
-        msg = create_message("alice", "bob", "Hello bob", summary="greeting")
+        msg = create_message("alice", "Hello bob")
         mailbox.write("bob-agent-id", msg)
 
         messages = mailbox.consume("bob-agent-id")
         assert len(messages) == 1
-        assert messages[0].content == "Hello bob"
+        assert messages[0].text == "Hello bob"
         assert messages[0].from_agent == "alice"
 
         # 已被消费 —— 此时应该为空
@@ -268,7 +271,7 @@ class TestMailbox:
 
     def test_read_without_consume(self, tmp_dir):
         mailbox = Mailbox(tmp_dir)
-        msg = create_message("alice", "bob", "Peek")
+        msg = create_message("alice", "Peek")
         mailbox.write("bob-id", msg)
 
         messages = mailbox.read("bob-id")
@@ -280,7 +283,7 @@ class TestMailbox:
 
     def test_broadcast(self, tmp_dir):
         mailbox = Mailbox(tmp_dir)
-        msg = create_message("alice", "*", "Team update", summary="update")
+        msg = create_message("alice", "Team update")
         mailbox.broadcast(["bob-id", "charlie-id", "alice-id"], msg, exclude="alice-id")
 
         bob_msgs = mailbox.consume("bob-id")
@@ -293,7 +296,7 @@ class TestMailbox:
 
     def test_cleanup(self, tmp_dir):
         mailbox = Mailbox(tmp_dir)
-        msg = create_message("a", "b", "test")
+        msg = create_message("a", "test")
         mailbox.write("agent-1", msg)
         mailbox.cleanup("agent-1")
         assert len(mailbox.read("agent-1")) == 0
@@ -302,6 +305,29 @@ class TestMailbox:
         mailbox = Mailbox(tmp_dir)
         assert mailbox.consume("nonexistent") == []
         assert mailbox.read("nonexistent") == []
+
+    def test_concurrent_writes_keep_every_message(self, tmp_dir):
+        """并发写同一个收件箱时不能丢消息，写失败也必须抛出来而不是静默吞掉。"""
+        import threading
+
+        mailbox = Mailbox(tmp_dir)
+        n = 20
+        errors: list[Exception] = []
+
+        def send(i: int) -> None:
+            try:
+                mailbox.write("dest", create_message("sender", f"msg-{i}"))
+            except Exception as e:  # noqa: BLE001 — 收集起来在主线程断言
+                errors.append(e)
+
+        threads = [threading.Thread(target=send, args=(i,)) for i in range(n)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert errors == []
+        assert len(mailbox.read("dest")) == n
 
 # =====================================================================
 # 4. AgentNameRegistry
@@ -322,13 +348,6 @@ class TestAgentNameRegistry:
         reg.unregister("bob")
         assert reg.resolve("bob") is None
 
-    def test_list_all(self):
-        reg = AgentNameRegistry.instance()
-        reg.register("alice", "a1")
-        reg.register("bob", "b1")
-        all_names = reg.list_all()
-        assert all_names == {"alice": "a1", "bob": "b1"}
-
     def test_singleton(self):
         r1 = AgentNameRegistry.instance()
         r2 = AgentNameRegistry.instance()
@@ -339,58 +358,85 @@ class TestAgentNameRegistry:
 # =====================================================================
 
 class TestBackendDetect:
+    def _clear_env(self) -> dict[str, str]:
+        # 清掉 tmux / iTerm2 相关环境变量，构造“不在任何会话里”的干净环境
+        env = {k: v for k, v in os.environ.items()}
+        env.pop("TMUX", None)
+        env.pop("ITERM_SESSION_ID", None)
+        return env
+
     def test_in_process_mode(self):
+        # 显式要求 in-process 时恒回退进程内
         result = detect_backend(teammate_mode="in-process")
         assert result == BackendType.IN_PROCESS
 
     def test_non_interactive(self):
+        # 非交互（-p）模式恒回退进程内
         result = detect_backend(is_interactive=False)
         assert result == BackendType.IN_PROCESS
 
-    def test_detect_backend_always_in_process(self):
-        # detect_backend 统一返回 IN_PROCESS，pane 检测由 detect_pane_backend 负责
-        with patch.dict(os.environ, {"TMUX": "/tmp/tmux-1234/default,12345,0"}):
-            result = detect_backend()
-            assert result == BackendType.IN_PROCESS
+    def test_from_env_tmux(self):
+        env = self._clear_env()
+        env["TMUX"] = "/tmp/tmux-1234/default,12345,0"
+        with patch.dict(os.environ, env, clear=True):
+            assert detect_backend_from_env() == BackendType.TMUX
 
-    def test_pane_tmux_session(self):
-        with patch.dict(os.environ, {"TMUX": "/tmp/tmux-1234/default,12345,0"}):
-            result = detect_pane_backend()
-            assert result == BackendType.TMUX
+    def test_from_env_iterm(self):
+        env = self._clear_env()
+        env["ITERM_SESSION_ID"] = "w0t0p0:ABC-123"
+        with patch.dict(os.environ, env, clear=True):
+            assert detect_backend_from_env() == BackendType.ITERM2
 
-    def test_pane_iterm2_with_it2(self):
-        env = {"TERM_PROGRAM": "iTerm.app"}
-        with patch.dict(os.environ, env, clear=False):
-            with patch("mewcode.teams.backend_detect.shutil.which") as mock_which:
-                def which_side_effect(cmd):
-                    if cmd == "it2":
-                        return "/usr/local/bin/it2"
-                    if cmd == "tmux":
-                        return None
-                    return None
-                mock_which.side_effect = which_side_effect
-                with patch.dict(os.environ, {"TMUX": ""}, clear=False):
-                    os.environ.pop("TMUX", None)
-                    result = detect_pane_backend()
-                    assert result == BackendType.ITERM2
+    def test_from_env_none_is_in_process(self):
+        env = self._clear_env()
+        with patch.dict(os.environ, env, clear=True):
+            assert detect_backend_from_env() == BackendType.IN_PROCESS
 
-    def test_pane_tmux_installed_not_in_session(self):
-        with patch.dict(os.environ, {}, clear=False):
-            os.environ.pop("TMUX", None)
-            os.environ.pop("TERM_PROGRAM", None)
-            with patch("mewcode.teams.backend_detect.shutil.which") as mock_which:
-                mock_which.return_value = "/usr/bin/tmux"
-                result = detect_pane_backend()
-                assert result == BackendType.TMUX
+    def test_tmux_precedence_over_iterm(self):
+        # 同时存在时 tmux 优先
+        env = self._clear_env()
+        env["TMUX"] = "/tmp/tmux-1234/default,12345,0"
+        env["ITERM_SESSION_ID"] = "w0t0p0:ABC-123"
+        with patch.dict(os.environ, env, clear=True):
+            assert detect_backend_from_env() == BackendType.TMUX
 
-    def test_pane_no_backend_falls_back_to_in_process(self):
-        # 没有外部终端时，detect_pane_backend 回退到 IN_PROCESS 而非抛异常
-        with patch.dict(os.environ, {}, clear=False):
-            os.environ.pop("TMUX", None)
-            os.environ.pop("TERM_PROGRAM", None)
-            with patch("mewcode.teams.backend_detect.shutil.which", return_value=None):
-                result = detect_pane_backend()
-                assert result == BackendType.IN_PROCESS
+    def test_detect_backend_windows_always_in_process(self):
+        # Windows 护栏：即便环境变量指示 tmux，也一律进程内
+        env = self._clear_env()
+        env["TMUX"] = "/tmp/tmux-1234/default,12345,0"
+        with patch.dict(os.environ, env, clear=True):
+            with patch("mewcode.teams.backend_detect.sys.platform", "win32"):
+                assert detect_backend() == BackendType.IN_PROCESS
+
+    def test_detect_backend_posix_tmux(self):
+        # 非 Windows + 身处 tmux 会话 → tmux 后端
+        env = self._clear_env()
+        env["TMUX"] = "/tmp/tmux-1234/default,12345,0"
+        with patch.dict(os.environ, env, clear=True):
+            with patch("mewcode.teams.backend_detect.sys.platform", "linux"):
+                assert detect_backend() == BackendType.TMUX
+
+    def test_detect_backend_posix_no_session(self):
+        # 非 Windows 但不在任何会话里 → 进程内
+        env = self._clear_env()
+        with patch.dict(os.environ, env, clear=True):
+            with patch("mewcode.teams.backend_detect.sys.platform", "linux"):
+                assert detect_backend() == BackendType.IN_PROCESS
+
+    def test_pane_backend_posix_iterm(self):
+        # detect_pane_backend 只在已身处会话时启用窗格
+        env = self._clear_env()
+        env["ITERM_SESSION_ID"] = "w0t0p0:ABC-123"
+        with patch.dict(os.environ, env, clear=True):
+            with patch("mewcode.teams.backend_detect.sys.platform", "darwin"):
+                assert detect_pane_backend() == BackendType.ITERM2
+
+    def test_pane_backend_no_session_falls_back(self):
+        # 没有会话环境变量时静默回退进程内，而非抛异常
+        env = self._clear_env()
+        with patch.dict(os.environ, env, clear=True):
+            with patch("mewcode.teams.backend_detect.sys.platform", "linux"):
+                assert detect_pane_backend() == BackendType.IN_PROCESS
 
 # =====================================================================
 # 6. Tool Filtering（工具过滤）
@@ -402,16 +448,26 @@ class TestToolFilter:
             assert tool_name in IN_PROCESS_TEAMMATE_ALLOWED_TOOLS
 
     def test_coordinator_mode_tools(self):
+        # 调度必需的工具
         assert "Agent" in COORDINATOR_MODE_ALLOWED_TOOLS
         assert "SendMessage" in COORDINATOR_MODE_ALLOWED_TOOLS
         assert "TaskStop" in COORDINATOR_MODE_ALLOWED_TOOLS
         assert "SyntheticOutput" in COORDINATOR_MODE_ALLOWED_TOOLS
-        assert "ReadFile" in COORDINATOR_MODE_ALLOWED_TOOLS
-        assert "Bash" in COORDINATOR_MODE_ALLOWED_TOOLS
-        assert "Glob" in COORDINATOR_MODE_ALLOWED_TOOLS
-        assert "Grep" in COORDINATOR_MODE_ALLOWED_TOOLS
+        # 看代码和改代码都该派给队员
+        assert "ReadFile" not in COORDINATOR_MODE_ALLOWED_TOOLS
+        assert "Bash" not in COORDINATOR_MODE_ALLOWED_TOOLS
+        assert "Glob" not in COORDINATOR_MODE_ALLOWED_TOOLS
+        assert "Grep" not in COORDINATOR_MODE_ALLOWED_TOOLS
         assert "WriteFile" not in COORDINATOR_MODE_ALLOWED_TOOLS
         assert "EditFile" not in COORDINATOR_MODE_ALLOWED_TOOLS
+        # 任务表是队员之间协调用的，Lead 靠 task-notification 掌握进度
+        assert "TaskCreate" not in COORDINATOR_MODE_ALLOWED_TOOLS
+        assert "TaskList" not in COORDINATOR_MODE_ALLOWED_TOOLS
+
+    def test_coordinator_keeps_team_delete_to_avoid_lock_in(self):
+        # TeamDelete 是解除 coordinator 模式的唯一入口，
+        # 挡掉它 Lead 建完 Team 就再也退不出来
+        assert "TeamDelete" in COORDINATOR_MODE_ALLOWED_TOOLS
 
     def test_apply_coordinator_filter(self):
         reg = make_registry(
@@ -423,20 +479,43 @@ class TestToolFilter:
         assert "Agent" in names
         assert "SendMessage" in names
         assert "SyntheticOutput" in names
-        assert "ReadFile" in names
-        assert "Bash" in names
+        assert "TaskStop" in names
+        assert "TeamDelete" in names
+        assert "ReadFile" not in names
+        assert "Bash" not in names
         assert "WriteFile" not in names
+
+    def test_apply_coordinator_filter_drops_mcp_tools(self):
+        # MCP 工具的返回值同样可能几千 token，要用就派队员去用
+        reg = make_registry("Agent", "mcp__github__create_issue")
+        names = {t.name for t in apply_coordinator_filter(reg).list_tools()}
+        assert "Agent" in names
+        assert "mcp__github__create_issue" not in names
 
 # =====================================================================
 # 7. Coordinator Mode（协调者模式）
 # =====================================================================
 
 class TestCoordinatorMode:
-    def test_disabled_by_default(self):
-        assert is_coordinator_mode(enable_flag=False) is False
+    def _agent_with_teams(self, enabled: bool, team_count: int):
+        from unittest.mock import MagicMock
 
-    def test_enabled_with_flag(self):
-        assert is_coordinator_mode(enable_flag=True) is True
+        agent = MagicMock()
+        agent.enable_coordinator_mode = enabled
+        agent._team_manager = MagicMock()
+        agent._team_manager.list_teams.return_value = ["squad"] * team_count
+        # 用真实 property 求值，不走 MagicMock 的自动属性
+        from mewcode.agent import Agent
+        return Agent.coordinator_mode.fget(agent)
+
+    def test_disabled_when_flag_off(self):
+        assert self._agent_with_teams(False, 1) is False
+
+    def test_enabled_from_the_first_turn(self):
+        # 只看配置：开了就从第一轮起生效，不等团队建起来。
+        # Agent 工具会在团队不存在时自己建，所以不必留个口子给 TeamCreate
+        assert self._agent_with_teams(True, 0) is True
+        assert self._agent_with_teams(True, 1) is True
 
     def test_system_prompt_contains_phases(self):
         prompt = get_coordinator_system_prompt()
@@ -456,22 +535,19 @@ class TestCoordinatorMode:
         assert "Spawn fresh" in prompt
 
     def test_system_prompt_task_notification(self):
+        # 指引描述的回传格式必须和 drain_lead_notifications 真正投递的一致，
+        # 否则 Lead 会照着一个不存在的字段去找队员名
         prompt = get_coordinator_system_prompt()
-        assert "<task-notification>" in prompt
-        assert "<task-id>" in prompt
+        assert "<team-notification" in prompt
+        assert "from=" in prompt
+        assert "<task_id>" not in prompt
 
-    def test_match_session_mode_no_switch(self):
-        result = match_session_mode("coordinator", enable_flag=True)
-        assert result is None
-
-    def test_match_session_mode_switch(self):
-        result = match_session_mode("coordinator", enable_flag=False)
-        assert result is not None
-        assert "Entered" in result
-
-    def test_match_session_mode_none(self):
-        result = match_session_mode(None)
-        assert result is None
+    def test_system_prompt_uses_real_subagent_type(self):
+        # MewCode 的内建类型是 general-purpose / plan / explore，没有 worker，
+        # 提示词里写 worker 会让 Lead 调用一个不存在的类型
+        prompt = get_coordinator_system_prompt()
+        assert 'subagent_type: "worker"' not in prompt
+        assert "subagent_type `worker`" not in prompt
 
     def test_coordinator_user_context(self):
         ctx = get_coordinator_user_context()
@@ -561,13 +637,208 @@ class TestAgentCoordinatorIntegration:
         assert "MewCode" in prompt
         assert IDENTITY_SECTION.content[:30] in prompt
 
-    def test_coordinator_prompt(self):
-        from mewcode.prompts import build_system_prompt
-        prompt = build_system_prompt(coordinator_mode=True)
-        assert "coordinator" in prompt.lower()
+    def test_coordinator_guidance_is_a_reminder_not_a_replacement(self):
+        # 调度指引每轮以 system-reminder 注入，系统提示词本身不受影响：
+        # Lead 进了 coordinator 也仍然需要身份、环境、项目指令这些基础段落
+        from mewcode.prompts import build_system_prompt, IDENTITY_SECTION
+        from mewcode.teams.coordinator import get_coordinator_system_prompt
 
-    def test_coordinator_mode_overrides_normal(self):
-        from mewcode.prompts import build_system_prompt
-        # coordinator 模式走独立的 prompt 生成路径，不包含普通 identity 段
-        prompt = build_system_prompt(coordinator_mode=True)
-        assert "coordinator" in prompt.lower()
+        prompt = build_system_prompt()
+        assert IDENTITY_SECTION.content[:30] in prompt
+        assert "coordinator" not in prompt.lower()
+
+        reminder = get_coordinator_system_prompt()
+        assert "coordinator" in reminder.lower()
+
+    def test_coordinator_reminder_lists_only_allowed_tools(self):
+        from mewcode.agents.tool_filter import COORDINATOR_MODE_ALLOWED_TOOLS
+        from mewcode.teams.coordinator import get_coordinator_system_prompt
+
+        reminder = get_coordinator_system_prompt()
+        section = reminder[
+            reminder.index("## 2. Your Tools") : reminder.index("### Worker Results")
+        ]
+        for name in COORDINATOR_MODE_ALLOWED_TOOLS:
+            assert f"**{name}**" in section, f"{name} 没出现在提示词的工具清单里"
+        for name in ["ReadFile", "Bash", "Grep", "TaskCreate", "TeamCreate"]:
+            assert f"**{name}**" not in section, f"提示词列了被过滤掉的 {name}"
+
+
+class TestTaskStopTool:
+    """TaskStop 让 Lead 在派错方向时及时止损。"""
+
+    def _mgr_with_member(self, backend="in-process", active=True):
+        from unittest.mock import MagicMock
+        from mewcode.teams.manager import TeamManager
+
+        mgr = TeamManager()
+        team = mgr.create_team("squad", "lead-1", description="t")
+        member = TeammateInfo(
+            name="scout", agent_id="a1", agent_type="general-purpose",
+            model="", worktree_path="", backend_type=backend, is_active=active,
+        )
+        team.add_member(member)
+        return mgr, team, member
+
+    @pytest.mark.asyncio
+    async def test_stops_in_process_teammate(self):
+        from mewcode.tools.task_stop import TaskStopTool, TaskStopParams
+
+        mgr, _, member = self._mgr_with_member()
+        handle = MagicMock()
+        handle.done = False
+        mgr.register_inprocess_handle(member.agent_id, handle)
+
+        res = await TaskStopTool(team_manager=mgr).execute(TaskStopParams(teammate="scout"))
+        assert not res.is_error
+        handle.cancel.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_stops_pane_teammate(self):
+        # tmux / iTerm2 的队员是独立进程，不走 in-process 句柄，
+        # 只认句柄就会漏掉这一类队员
+        from mewcode.tools.task_stop import TaskStopTool, TaskStopParams
+
+        mgr, _, member = self._mgr_with_member(backend="tmux")
+        mgr.register_pane_id(member.agent_id, "%42")
+        killed = []
+        mgr._kill_pane = lambda pane, backend: killed.append((pane, backend))
+
+        res = await TaskStopTool(team_manager=mgr).execute(TaskStopParams(teammate="scout"))
+        assert not res.is_error
+        assert killed == [("%42", "tmux")]
+
+    @pytest.mark.asyncio
+    async def test_unknown_teammate_is_an_error(self):
+        from mewcode.tools.task_stop import TaskStopTool, TaskStopParams
+
+        mgr, _, _ = self._mgr_with_member()
+        res = await TaskStopTool(team_manager=mgr).execute(TaskStopParams(teammate="ghost"))
+        assert res.is_error
+
+    @pytest.mark.asyncio
+    async def test_idle_teammate_is_not_an_error(self):
+        # 已经停下的队员再停一次不该报错，免得模型拿着报错反复重试
+        from mewcode.tools.task_stop import TaskStopTool, TaskStopParams
+
+        mgr, _, _ = self._mgr_with_member()
+        res = await TaskStopTool(team_manager=mgr).execute(TaskStopParams(teammate="scout"))
+        assert not res.is_error
+        assert "nothing to stop" in res.output
+
+
+class TestCoordinatorReminderShape:
+    def test_reminder_matches_real_notification_format(self):
+        # 指引描述的回传格式必须和 drain 出来的一致
+        from mewcode.teams.coordinator import get_coordinator_system_prompt
+
+        p = get_coordinator_system_prompt()
+        assert "<team-notification" in p and "from=" in p
+        assert "<task_id>" not in p
+
+    def test_reminder_goes_sparse_after_first_turn(self):
+        from mewcode.teams.coordinator import get_coordinator_reminder
+
+        full = get_coordinator_reminder(1)
+        second = get_coordinator_reminder(2)
+        assert len(second) < len(full)
+        for must in ["cannot read files", "TaskStop", "from="]:
+            assert must in second
+        assert any(get_coordinator_reminder(i) == full for i in range(2, 13))
+
+
+class TestTeamFileSchema:
+    """config.json 的字段格式：键名一律 camelCase。"""
+
+    def test_config_json_uses_camel_case_keys(self, tmp_dir):
+        team = AgentTeam(
+            name="squad",
+            lead_agent_id="lead",
+            config_path=str(Path(tmp_dir) / "config.json"),
+            description="d",
+        )
+        team.add_member(TeammateInfo(
+            name="alice", agent_id="a1", agent_type="worker", model="m",
+            worktree_path="/wt", backend_type="in-process",
+            is_active=False, joined_at=123,
+        ))
+        team.save()
+
+        data = json.loads(Path(team.config_path).read_text(encoding="utf-8"))
+        assert set(data) == {"name", "description", "createdAt", "leadAgentId", "members"}
+        assert set(data["members"][0]) == {
+            "agentId", "name", "agentType", "model",
+            "joinedAt", "worktreePath", "backendType", "isActive",
+        }
+        # config_path 是运行时算出来的，不该写进文件
+        assert "config_path" not in data and "configPath" not in data
+
+    def test_round_trip_keeps_fields(self, tmp_dir):
+        cfg = str(Path(tmp_dir) / "config.json")
+        team = AgentTeam(name="squad", lead_agent_id="lead", config_path=cfg, description="d")
+        team.add_member(TeammateInfo(
+            name="alice", agent_id="a1", agent_type="worker", model="m",
+            worktree_path="/wt", backend_type="in-process",
+            is_active=False, joined_at=123,
+        ))
+        team.save()
+
+        loaded = AgentTeam.load(cfg)
+        assert loaded.lead_agent_id == "lead"
+        assert loaded.description == "d"
+        assert loaded.created_at > 0
+        m = loaded.get_member("alice")
+        assert m is not None
+        assert (m.agent_id, m.agent_type, m.model, m.worktree_path,
+                m.backend_type, m.is_active, m.joined_at) == \
+               ("a1", "worker", "m", "/wt", "in-process", False, 123)
+
+# =====================================================================
+# 后台任务的 idle 回传
+# =====================================================================
+
+class TestBackgroundTaskIdleNotification:
+    """in-process 队友由 TaskManager 拉起，跑完要把 idle 通知投进 lead 的信箱。
+
+    lead 读信箱用的是 team.lead_agent_id，投递方用别的键写进去，
+    消息会落在一个 lead 不读的收件箱里，派活链路就断了。
+    """
+
+    @pytest.mark.asyncio
+    async def test_idle_lands_in_lead_inbox(self):
+        from mewcode.agents.task_manager import TaskManager
+        from mewcode.teams.manager import TeamManager
+
+        mgr = TeamManager()
+        team = mgr.create_team("idle-notify", "lead-agent-uuid-1", description="t")
+
+        agent = MagicMock()
+        agent.agent_id = "worker-agent-id"
+        agent.team_name = team.name
+        agent._team_manager = mgr
+        agent.total_input_tokens = 0
+        agent.total_output_tokens = 0
+        agent.run_to_completion = AsyncMock(return_value="done")
+
+        task_mgr = TaskManager()
+        task_id = task_mgr.launch(agent, "do the thing", name="scout")
+        try:
+            # 第一条 idle 通知在空闲轮询之前发出，让出事件循环就能拿到
+            await asyncio.sleep(0.05)
+
+            mailbox = mgr.get_mailbox(team.name)
+            assert mailbox is not None
+
+            msgs = mailbox.consume(team.lead_agent_id)
+            assert len(msgs) == 1
+            assert msgs[0].from_agent == "scout"
+            assert "[idle]" in msgs[0].text
+
+            # LEAD_NAME 是 lead 的显示名，不是信箱键，不该有消息投到这里
+            assert mailbox.consume("lead") == []
+        finally:
+            task = task_mgr._async_tasks.get(task_id)
+            if task is not None:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task

@@ -38,7 +38,6 @@ class ExitWorktreeTool(Tool):
     )
     params_model = ExitWorktreeParams
     category = "command"
-    should_defer = True
 
 
     def __init__(self, worktree_manager: WorktreeManager) -> None:

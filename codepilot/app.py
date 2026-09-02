@@ -11,6 +11,7 @@ import time as _time
 from pathlib import Path
 from typing import Any
 
+from rich.markup import escape
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
@@ -47,12 +48,14 @@ from mewcode.commands import (
     complete,
     parse_command,
 )
+from mewcode import crashlog
 from mewcode.commands.completion import CompletionPopup
 from mewcode.commands.handlers import register_all_commands
 from mewcode.config import MCPServerConfig, ProviderConfig
 from mewcode.hooks import HookContext, HookEngine, load_hooks
 from mewcode.conversation import ConversationManager, Message
 from mewcode.mcp import ConnectResult, MCPManager
+from mewcode.mcp.tool_wrapper import mcp_tool_name_prefix
 from mewcode.memory import (
     MemoryManager,
     Session,
@@ -80,11 +83,11 @@ from mewcode.skills.loader import SkillLoader
 from mewcode.commands.handlers.skill_register import register_skill_commands
 from rich.text import Text as RichText
 from textual.theme import Theme
-from mewcode.cache import FileCache
 from mewcode.tools import ToolRegistry, create_default_registry
 from mewcode.tools.agent_tool import AgentTool
 from mewcode.tools.ask_user import AskUserEvent, AskUserTool
 from mewcode.tools.impl.tool_search import ToolSearchTool
+from mewcode.tools.mcp_call import McpCallTool
 from mewcode.tools.install_skill import InstallSkillTool
 from mewcode.tools.load_skill import LoadSkill
 from mewcode.worktree.cleanup import start_stale_cleanup_task
@@ -339,7 +342,22 @@ def _format_detail(tool_name: str, arguments: dict[str, Any], output: str) -> st
         parts.append("")
         for line in output.splitlines():
             parts.append(f"  OUT  {line}")
-    elif tool_name in ("ReadFile", "WriteFile", "EditFile"):
+    elif tool_name == "EditFile":
+        # EditFile 的 output 是 build_diff() 生成的带行号 diff 文本：
+        # "+ " 开头绿色、"- " 开头红色，其余（上下文行/摘要行）走 dim。
+        # 转义 Rich markup 特殊字符，避免代码里的方括号被当成标签解析。
+        for line in output.splitlines()[:MAX_TRUNCATED_LINES]:
+            escaped = escape(line)
+            if line.startswith("+ "):
+                parts.append(f"  [green]{escaped}[/]")
+            elif line.startswith("- "):
+                parts.append(f"  [red]{escaped}[/]")
+            else:
+                parts.append(f"  [dim]{escaped}[/]")
+        total = output.count("\n") + 1
+        if total > MAX_TRUNCATED_LINES:
+            parts.append(f"  [dim]… ({total - MAX_TRUNCATED_LINES} more lines)[/]")
+    elif tool_name in ("ReadFile", "WriteFile"):
         parts.append(f"  {arguments.get('file_path', '')}")
         parts.append("")
         for line in output.splitlines()[:MAX_TRUNCATED_LINES]:
@@ -380,11 +398,17 @@ class ToolCallBlock(Static, can_focus=True):
         self._is_error = is_error
         self._elapsed = elapsed
         self._loading = False
-        self._collapsed = True
         self.remove_class("tool-block-loading")
         if is_error:
             self.add_class("tool-block-error")
-        self._render_collapsed()
+        # EditFile 的 diff 是最高频需要的信息，默认直接展开，不用等用户点
+        # 或按 ctrl+o；其余工具仍然默认折叠，避免刷屏。
+        if self.tool_name == "EditFile" and not is_error:
+            self._collapsed = False
+            self._render_expanded()
+        else:
+            self._collapsed = True
+            self._render_collapsed()
 
     def _render_collapsed(self) -> None:
         if self._is_error:
@@ -461,7 +485,7 @@ THINKING_VERBS = [
     "Spinning", "Sprouting", "Synthesizing", "Thinking", "Tinkering",
     "Transfiguring", "Transmuting", "Undulating", "Unfurling", "Unravelling",
     "Vibing", "Wandering", "Whisking", "Working", "Wrangling", "Zigzagging",
-]  # 共 105 个动词，与 Go 版 internal/tui/verbs.go 完全一致
+]  # 共 105 个 TUI 快捷键动词
 
 
 class ToolGroupSummary(Static, can_focus=True):
@@ -575,7 +599,7 @@ class MewCodeApp(App):
         permission_mode: PermissionMode = PermissionMode.DEFAULT,
         mcp_servers: list[MCPServerConfig] | None = None,
         hook_engine: HookEngine | None = None,
-        enable_fork: bool = False,
+        enable_fork: bool = True,
         enable_verification_agent: bool = False,
         worktree_config: Any = None,
         teammate_mode: str = "",
@@ -595,10 +619,9 @@ class MewCodeApp(App):
         self._enable_coordinator_mode = enable_coordinator_mode
         from mewcode.config import SandboxAppConfig
         self._sandbox_cfg: SandboxAppConfig = sandbox_config or SandboxAppConfig()
-        self.file_cache = FileCache()
         self.client: LLMClient | None = None
         self.conversation = ConversationManager()
-        self.registry: ToolRegistry = create_default_registry(file_cache=self.file_cache)
+        self.registry: ToolRegistry = create_default_registry()
         self.agent: Agent | None = None
         self.mcp_manager: MCPManager | None = None
         self._mcp_init_task: asyncio.Task[None] | None = None
@@ -671,6 +694,16 @@ class MewCodeApp(App):
                 yield Static("", id="teammates-label")
                 yield Static("", id="model-label")
             yield CompletionPopup()
+
+    def _handle_exception(self, error: Exception) -> None:
+        """接管 Textual 的未处理异常入口，先把现场落盘再交回框架。
+
+        框架拿到未处理异常后会把 traceback 画到终端然后结束应用，终端一关
+        就什么都不剩了。事件处理器、后台 worker、刷新回调抛出的异常都汇聚
+        到这里，写进崩溃日志才能在事后定位。
+        """
+        crashlog.record_exception("textual", error)
+        super()._handle_exception(error)
 
     def on_mount(self) -> None:
         self.register_theme(_MEWCODE_THEME)
@@ -749,6 +782,9 @@ class MewCodeApp(App):
         self.registry.register(
             ToolSearchTool(self.registry, protocol=provider.protocol)
         )
+        # mcp_call 必须在 MCP 连接之前就注册好。等连上再按加载模式决定注不注册，
+        # 本身就是一次中途改动 tools[]，缓存前缀照样断。
+        self.registry.register(McpCallTool(self.registry))
         self.registry.register(AskUserTool())
 
         from mewcode.tools.exit_plan_mode import ExitPlanModeTool
@@ -792,6 +828,7 @@ class MewCodeApp(App):
             client=self.client,
             protocol=provider.protocol,
         )
+        load_skill_tool.set_executor(self.skill_executor)
 
         catalog = self.skill_loader.get_catalog()
         if catalog:
@@ -920,9 +957,22 @@ class MewCodeApp(App):
         self.command_registry.register_sync(trace_cmd)
 
         # --- 协调者模式初始化（工具已注册，激活推迟到 TeamCreate 时） ---
+        from mewcode.tools.send_message import SendMessageTool
         from mewcode.tools.synthetic_output import SyntheticOutputTool
+        from mewcode.tools.task_stop import TaskStopTool
 
         self.registry.register(SyntheticOutputTool())
+        self.registry.register(TaskStopTool(team_manager=self.team_manager))
+        # Lead 给队员派活、续写都走这个工具，团队要等 TeamCreate 才存在，
+        # 所以这里不绑定团队，发信时再取当前团队
+        self.registry.register(SendMessageTool(team_manager=self.team_manager))
+
+        # coordinator 模式由配置决定，开了就从第一轮起收窄工具集
+        if self._enable_coordinator_mode:
+            from mewcode.agents.tool_filter import apply_coordinator_filter
+
+            self.agent.enable_coordinator_mode = True
+            self.agent.registry = apply_coordinator_filter(self.agent.registry)
         self.agent._team_manager = self.team_manager
 
         if self.hook_engine:
@@ -1315,7 +1365,7 @@ class MewCodeApp(App):
             self.conversation.add_system_reminder(self._mcp_instructions)
             self._mcp_instructions_ok = True
 
-        # 非阻塞 memory recall：传给 agent，工具执行后注入（与 Claude Code 一致）
+        # 非阻塞 memory recall：传给 agent，工具执行后注入
         if prefetch_task is not None:
             self.agent.memory_recall_task = prefetch_task
             self.agent._memory_recall_consumed = False
@@ -1779,8 +1829,10 @@ class MewCodeApp(App):
         from mewcode.permission_dialog import InlinePermissionWidget
 
         req = getattr(self, "_pending_perm_request", None)
-        if req is not None:
+        # future 可能已经结束（本轮被取消时会被 cancel），此时不能再回填结果
+        if req is not None and not req.future.done():
             req.future.set_result(event.response)
+        if req is not None:
             self._pending_perm_request = None
         # 从聊天区移除权限弹窗组件
         try:
@@ -1859,13 +1911,22 @@ class MewCodeApp(App):
             self._show_system_message(f"MCP warning: {err}")
         tools_after = len(self.registry.list_tools())
         mcp_tools = tools_after - tools_before
+        # 工具都在位了才算得准 schema 总量跟上下文窗口的比例
+        if self._selected_provider is not None:
+            from mewcode.mcp.loading_strategy import decide_and_apply
+
+            decide_and_apply(
+                self.registry,
+                base_url=self._selected_provider.base_url,
+                context_window=self._selected_provider.get_context_window(),
+            )
         server_count = len(connect_result.servers)
         if server_count > 0:
             self._mcp_server_info = (
                 f"Connected to {server_count} MCP server(s), {mcp_tools} tools registered"
             )
         if server_count > 0 and mcp_tools > 0:
-            # 构建 MCP 指令：对齐 Go 版，从 InitializeResult 提取 instructions
+            # 构建 MCP 指令，从 InitializeResult 提取 instructions
             parts = []
             for srv_info in connect_result.servers:
                 section = f"## {srv_info.name}\n"
@@ -1874,9 +1935,10 @@ class MewCodeApp(App):
                     section += srv_info.instructions
                 else:
                     # 回退：列出该服务器注册的工具名
+                    prefix = mcp_tool_name_prefix(srv_info.name)
                     tool_names = [
                         t.name for t in self.registry.list_tools()
-                        if t.name.startswith(f"mcp__{srv_info.name}__")
+                        if t.name.startswith(prefix)
                     ]
                     if tool_names:
                         section += "Available tools: " + ", ".join(tool_names)

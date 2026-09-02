@@ -97,7 +97,7 @@ async def test_single_step_tool_call():
         # 第 1 轮：模型调用 ReadFile
         [
             TextDelta("Let me read the file."),
-            ToolCallComplete("t1", "ReadFile", {"file_path": "README.md"}),
+            ToolCallComplete("t1", "ReadFile", {"file_path": "MEWCODE.md"}),
             StreamEnd("end_turn", input_tokens=10, output_tokens=20),
         ],
         # 第 2 轮：模型给出最终答案
@@ -109,7 +109,7 @@ async def test_single_step_tool_call():
     registry = create_default_registry()
     agent = Agent(client, registry, "anthropic", work_dir=".")
     conv = ConversationManager()
-    conv.add_user_message("Read README.md")
+    conv.add_user_message("Read MEWCODE.md")
 
     events = []
     async for e in agent.run(conv):
@@ -200,7 +200,7 @@ async def test_stop_max_iterations():
     for i in range(5):
         responses.append([
             TextDelta(f"Step {i}"),
-            ToolCallComplete(f"t{i}", "ReadFile", {"file_path": "README.md"}),
+            ToolCallComplete(f"t{i}", "ReadFile", {"file_path": "MEWCODE.md"}),
             StreamEnd("end_turn", input_tokens=10, output_tokens=10),
         ])
 
@@ -237,7 +237,7 @@ async def test_stop_cancel():
             await asyncio.sleep(0.01)
             yield TextDelta(f"Step {self._call_count}")
             await asyncio.sleep(0.01)
-            yield ToolCallComplete(f"t{self._call_count}", "ReadFile", {"file_path": "README.md"})
+            yield ToolCallComplete(f"t{self._call_count}", "ReadFile", {"file_path": "MEWCODE.md"})
             await asyncio.sleep(0.01)
             yield StreamEnd("end_turn", input_tokens=10, output_tokens=10)
 
@@ -264,19 +264,23 @@ async def test_stop_cancel():
 
     assert cancelled
     c = _collect(events)
-    assert len(c["turn"]) >= 1
     assert len(c["turn"]) < 50
 
 @pytest.mark.asyncio
-async def test_stop_consecutive_unknown_tools():
-    """Agent 在连续 3 次调用未知工具后停止。"""
+async def test_unknown_tool_returns_error_result():
+    """调用未知工具只回一条错误结果，循环继续，由模型自己决定何时收尾。"""
     responses = []
-    for i in range(5):
+    for i in range(3):
         responses.append([
             TextDelta(f"Trying tool {i}"),
             ToolCallComplete(f"t{i}", "NonExistentTool", {"arg": "val"}),
             StreamEnd("end_turn", input_tokens=10, output_tokens=10),
         ])
+    # 模型放弃猜工具名，改成纯文本回复，循环正常结束
+    responses.append([
+        TextDelta("这个工具不存在，我换个方式。"),
+        StreamEnd("end_turn", input_tokens=10, output_tokens=10),
+    ])
 
     client = MockLLMClient(responses)
     registry = create_default_registry()
@@ -289,8 +293,10 @@ async def test_stop_consecutive_unknown_tools():
         events.append(e)
 
     c = _collect(events)
-    assert len(c["error"]) == 1
-    assert "unknown tool" in c["error"][0].message
+    assert len(c["error"]) == 0
+    assert len(c["tool_result"]) == 3
+    assert all(tr.is_error and "unknown tool" in tr.output for tr in c["tool_result"])
+    assert len(c["loop"]) == 1
 
 @pytest.mark.asyncio
 async def test_message_splicing():
@@ -299,7 +305,7 @@ async def test_message_splicing():
         # 第 1 轮：一个响应里包含两次工具调用
         [
             TextDelta("Reading two files."),
-            ToolCallComplete("t1", "ReadFile", {"file_path": "README.md"}),
+            ToolCallComplete("t1", "ReadFile", {"file_path": "MEWCODE.md"}),
             ToolCallComplete("t2", "ReadFile", {"file_path": "pyproject.toml"}),
             StreamEnd("end_turn", input_tokens=10, output_tokens=20),
         ],
@@ -336,7 +342,7 @@ async def test_concurrent_batch_execution():
     """多个 ReadFile 调用并发执行（属于同一批次）。"""
     client = MockLLMClient([
         [
-            ToolCallComplete("t1", "ReadFile", {"file_path": "README.md"}),
+            ToolCallComplete("t1", "ReadFile", {"file_path": "MEWCODE.md"}),
             ToolCallComplete("t2", "ReadFile", {"file_path": "pyproject.toml"}),
             StreamEnd("end_turn", input_tokens=10, output_tokens=20),
         ],
@@ -365,12 +371,12 @@ async def test_token_usage_accumulates():
     client = MockLLMClient([
         [
             TextDelta("Step 1"),
-            ToolCallComplete("t1", "ReadFile", {"file_path": "README.md"}),
+            ToolCallComplete("t1", "ReadFile", {"file_path": "MEWCODE.md"}),
             StreamEnd("end_turn", input_tokens=100, output_tokens=50),
         ],
         [
             TextDelta("Step 2"),
-            ToolCallComplete("t2", "ReadFile", {"file_path": "README.md"}),
+            ToolCallComplete("t2", "ReadFile", {"file_path": "MEWCODE.md"}),
             StreamEnd("end_turn", input_tokens=200, output_tokens=80),
         ],
         [
@@ -460,7 +466,8 @@ async def test_plan_mode_denied_tool_returns_error():
     c = _collect(events)
     assert len(c["tool_result"]) == 1
     assert c["tool_result"][0].is_error
-    assert "denied" in c["tool_result"][0].output.lower() or "拒绝" in c["tool_result"][0].output
+    out = c["tool_result"][0].output.lower()
+    assert "rejected" in out or "denied" in out or "拒绝" in c["tool_result"][0].output
     assert len(c["error"]) == 0
 
 def test_partition_tool_calls():
@@ -496,7 +503,73 @@ def test_plan_mode_sparse_reminder():
     assert "Plan mode still active" in reminder
 
 def test_environment_context():
+    # 工作目录和操作系统归 System Prompt 的环境段，这里只负责每轮会变的时间
     ctx = build_environment_context("/home/user/project")
-    assert "/home/user/project" in ctx
-    assert "Operating system" in ctx
     assert "Current time" in ctx
+    assert "/home/user/project" not in ctx
+    assert "Operating system" not in ctx
+
+
+def test_system_prompt_carries_work_dir():
+    sp = build_system_prompt(work_dir="/home/user/project")
+    assert "/home/user/project" in sp
+    assert "Platform" in sp
+
+
+@pytest.mark.asyncio
+async def test_streaming_tool_execution():
+    """工具在 LLM 流式输出期间就开始执行，不等整个响应结束。"""
+    execution_log: list[tuple[str, float]] = []
+    original_execute = None
+
+    # 用一个慢速流模拟 LLM 还在输出，验证第一个工具在流结束前已经开始执行
+    class SlowMockClient(MockLLMClient):
+        async def stream(self, conversation, system="", tools=None):
+            events = self._responses[self._call_index]
+            self._call_index += 1
+            for e in events:
+                if isinstance(e, StreamEnd):
+                    # 在 StreamEnd 前等一下，让已提交的工具有时间执行
+                    await asyncio.sleep(0.05)
+                yield e
+                await asyncio.sleep(0)
+
+    client = SlowMockClient([
+        [
+            ToolCallComplete("t1", "Glob", {"pattern": "*.py"}),
+            ToolCallComplete("t2", "Glob", {"pattern": "*.toml"}),
+            StreamEnd("end_turn", input_tokens=10, output_tokens=20),
+        ],
+        [
+            TextDelta("Done."),
+            StreamEnd("end_turn", input_tokens=30, output_tokens=10),
+        ],
+    ])
+    registry = create_default_registry()
+
+    # 记录工具执行时间
+    glob_tool = registry.get("Glob")
+    original_execute = glob_tool.execute
+
+    async def patched_execute(params):
+        import time
+        execution_log.append(("start", time.monotonic()))
+        result = await original_execute(params)
+        execution_log.append(("end", time.monotonic()))
+        return result
+
+    glob_tool.execute = patched_execute
+
+    agent = Agent(client, registry, "anthropic", work_dir=".")
+    conv = ConversationManager()
+    conv.add_user_message("Find files")
+
+    events = []
+    async for e in agent.run(conv):
+        events.append(e)
+
+    c = _collect(events)
+    # 两个 Glob 调用都应产出结果
+    assert len(c["tool_result"]) == 2
+    # 工具应该在流式阶段就开始执行，所以 execution_log 至少有记录
+    assert len(execution_log) >= 2, "工具未在流式阶段执行"

@@ -72,7 +72,7 @@ class AgentLoader:
                     tools=meta.get("tools", []),
                     disallowed_tools=meta.get("disallowedTools", []),
                     model=str(meta.get("model", "inherit")),
-                    max_turns=meta.get("maxTurns") or 200,  # 对齐 Go：未指定时默认 200
+                    max_turns=meta.get("maxTurns") or 200,  # 未指定时默认 200
                     permission_mode=str(meta.get("permissionMode", "default")),
                     background=bool(meta.get("background", False)),
                     file_path=None,

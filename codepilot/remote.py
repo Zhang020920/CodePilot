@@ -48,6 +48,7 @@ from mewcode.config import MCPServerConfig, ProviderConfig
 from mewcode.conversation import ConversationManager
 from mewcode.hooks import HookEngine
 from mewcode.mcp import MCPManager
+from mewcode.mcp.tool_wrapper import mcp_tool_name_prefix
 from mewcode.memory import MemoryManager, load_instructions
 from mewcode.memory.session import Session, SessionManager
 from mewcode.permissions import (
@@ -60,6 +61,7 @@ from mewcode.permissions import (
 from mewcode.skills.loader import SkillLoader
 from mewcode.tools import ToolRegistry, create_default_registry
 from mewcode.tools.impl.tool_search import ToolSearchTool
+from mewcode.tools.mcp_call import McpCallTool
 from mewcode.tools.load_skill import LoadSkill
 from mewcode.web_content import INDEX_HTML
 
@@ -76,7 +78,9 @@ class RemoteServer:
         hook_engine: HookEngine | None = None,
         addr: str = "0.0.0.0",
         port: int = 18888,
+        config: object | None = None,
     ) -> None:
+        self._config = config
         self.providers = providers
         self._mcp_server_configs = mcp_servers or []
         self.hook_engine = hook_engine
@@ -250,6 +254,7 @@ class RemoteServer:
         # 工具注册表
         self.registry = create_default_registry()
         self.registry.register(ToolSearchTool(self.registry, protocol=provider.protocol))
+        self.registry.register(McpCallTool(self.registry))
 
         # Skill 加载
         self.skill_loader = SkillLoader(work_dir)
@@ -270,6 +275,68 @@ class RemoteServer:
             hook_engine=self.hook_engine,
         )
         self.agent.session_id = self.session_id
+
+        # 团队工具在 remote 模式下同样可用，Lead 能在浏览器会话里组建团队把活派出去
+        from mewcode.agents.loader import AgentLoader
+        from mewcode.agents.task_manager import TaskManager
+        from mewcode.agents.trace import TraceManager
+        from mewcode.config import WorktreeConfig
+        from mewcode.teams.manager import TeamManager
+        from mewcode.tools.agent_tool import AgentTool
+        from mewcode.tools.synthetic_output import SyntheticOutputTool
+        from mewcode.tools.task_stop import TaskStopTool
+        from mewcode.tools.team_create import TeamCreateTool
+        from mewcode.tools.team_delete import TeamDeleteTool
+        from mewcode.worktree import WorktreeManager
+
+        cfg = self._config
+        enable_fork = getattr(cfg, "enable_fork", False)
+        enable_verification = getattr(cfg, "enable_verification_agent", False)
+        enable_coordinator = getattr(cfg, "enable_coordinator_mode", False)
+        wt_cfg = getattr(cfg, "worktree", None) or WorktreeConfig()
+
+        wt_manager = WorktreeManager(
+            repo_root=work_dir,
+            symlink_directories=wt_cfg.symlink_directories,
+        )
+        trace_manager = TraceManager()
+        self.task_manager = TaskManager()
+        agent_loader = AgentLoader(work_dir, enable_verification=enable_verification)
+        agent_loader.load_all()
+        self.team_manager = TeamManager(
+            worktree_manager=wt_manager, trace_manager=trace_manager
+        )
+
+        self.registry.register(AgentTool(
+            agent_loader=agent_loader,
+            task_manager=self.task_manager,
+            trace_manager=trace_manager,
+            parent_agent=self.agent,
+            enable_fork=enable_fork,
+            provider_config=provider,
+            worktree_manager=wt_manager,
+            team_manager=self.team_manager,
+        ))
+        self.registry.register(TeamCreateTool(
+            team_manager=self.team_manager,
+            parent_agent=self.agent,
+            teammate_mode="in-process",
+            is_interactive=False,
+            enable_coordinator_mode=enable_coordinator,
+        ))
+        self.registry.register(TeamDeleteTool(
+            team_manager=self.team_manager, parent_agent=self.agent
+        ))
+        self.registry.register(TaskStopTool(team_manager=self.team_manager))
+        self.registry.register(SyntheticOutputTool())
+        # Lead 给队员派活、续写都走这个工具，团队要等 TeamCreate 才存在，
+        # 所以这里不绑定团队，发信时再取当前团队
+        from mewcode.tools.send_message import SendMessageTool
+
+        self.registry.register(SendMessageTool(team_manager=self.team_manager))
+
+        # 队员干完活的回传落在 lead 信箱里，每轮排空成 system-reminder 交给 Lead
+        self.agent.notification_fn = self.team_manager.drain_lead_mailbox
 
         # 连接 Skill 到 Agent
         load_skill_tool.set_loader(self.skill_loader)
@@ -306,6 +373,17 @@ class RemoteServer:
         for err in connect_result.errors:
             log.warning("MCP error: %s", err)
 
+        # 工具都在位了才算得准 schema 总量跟上下文窗口的比例
+        if self.providers:
+            from mewcode.mcp.loading_strategy import decide_and_apply
+
+            provider = self.providers[0]
+            decide_and_apply(
+                self.registry,
+                base_url=provider.base_url,
+                context_window=provider.get_context_window(),
+            )
+
         # 构建 MCP 指令（首次发送消息时注入 conversation）
         if connect_result.servers:
             parts = []
@@ -314,9 +392,10 @@ class RemoteServer:
                 if srv_info.instructions:
                     section += srv_info.instructions
                 else:
+                    prefix = mcp_tool_name_prefix(srv_info.name)
                     tool_names = [
                         t.name for t in self.registry.list_tools()
-                        if t.name.startswith(f"mcp__{srv_info.name}__")
+                        if t.name.startswith(prefix)
                     ]
                     if tool_names:
                         section += "Available tools: " + ", ".join(tool_names)
@@ -669,7 +748,9 @@ class RemoteServer:
             "allowAlways": PermissionResponse.ALLOW_ALWAYS,
         }
         response = mapping.get(response_str, PermissionResponse.DENY)
-        future.set_result(response)
+        # future 可能已经结束（本轮被取消时会被 cancel），此时不能再回填结果
+        if not future.done():
+            future.set_result(response)
 
     # ------------------------------------------------------------------
     # 辅助方法

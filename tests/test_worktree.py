@@ -15,7 +15,6 @@ from pathlib import Path
 
 import pytest
 
-from mewcode.cache import FileCache
 from mewcode.config import WorktreeConfig, load_config
 from mewcode.worktree.changes import count_worktree_changes, has_worktree_changes
 from mewcode.worktree.integration import build_worktree_notice, generate_worktree_name
@@ -84,40 +83,7 @@ class TestFlattenSlug:
         assert flatten_slug("a/b/c") == "a+b+c"
 
 # =========================================================================
-# B. FileCache
-# =========================================================================
-
-class TestFileCache:
-    def test_put_and_get(self):
-        cache = FileCache()
-        cache.put("/tmp/test.py", "content")
-        assert cache.get("/tmp/test.py") == "content"
-
-    def test_miss(self):
-        cache = FileCache()
-        assert cache.get("/nonexistent") is None
-
-    def test_invalidate(self):
-        cache = FileCache()
-        cache.put("/tmp/test.py", "content")
-        cache.invalidate("/tmp/test.py")
-        assert cache.get("/tmp/test.py") is None
-
-    def test_clear(self):
-        cache = FileCache()
-        cache.put("/a", "1")
-        cache.put("/b", "2")
-        assert len(cache) == 2
-        cache.clear()
-        assert len(cache) == 0
-        assert cache.get("/a") is None
-
-    def test_invalidate_nonexistent(self):
-        cache = FileCache()
-        cache.invalidate("/nonexistent")  # 不应抛出异常
-
-# =========================================================================
-# C. 配置扩展
+# B. 配置扩展
 # =========================================================================
 
 class TestWorktreeConfig:

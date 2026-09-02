@@ -92,13 +92,18 @@ class TaskManager:
                 mailbox = bg.agent._team_manager.get_mailbox(bg.agent.team_name)
                 if mailbox:
                     from mewcode.teams.mailbox import create_message
+                    from mewcode.teams.spawn_inprocess import LEAD_NAME
+
+                    # lead 侧 drain_lead_mailbox / SendMessage 都按 lead_agent_id
+                    # 存取信箱，回传 idle 通知必须用同一个键才能被 lead 读到。
+                    team = bg.agent._team_manager.get_team(bg.agent.team_name)
+                    lead_key = team.lead_agent_id if team else LEAD_NAME
+
                     msg = create_message(
                         from_agent=bg.name,
-                        to_agent="lead",
-                        content=f"[idle] {bg.name}: completed initial task",
-                        summary=f"{bg.name} idle",
+                        text=f"[idle] {bg.name} (reason: available)",
                     )
-                    mailbox.write("lead", msg)
+                    mailbox.write(lead_key, msg)
 
                     for _ in range(60):
                         await asyncio.sleep(1)
@@ -106,17 +111,15 @@ class TaskManager:
                         if not msgs:
                             continue
                         prompt = "\n\n".join(
-                            f"[Message from {m.from_agent}] {m.content}" for m in msgs
+                            f"[Message from {m.from_agent}] {m.text}" for m in msgs
                         )
                         result = await bg.agent.run_to_completion(prompt)
                         bg.result = result
                         msg = create_message(
                             from_agent=bg.name,
-                            to_agent="lead",
-                            content=f"[idle] {bg.name}: completed follow-up",
-                            summary=f"{bg.name} idle",
+                            text=f"[idle] {bg.name} (reason: available)",
                         )
-                        mailbox.write("lead", msg)
+                        mailbox.write(lead_key, msg)
 
         except asyncio.CancelledError:
             bg.status = "cancelled"

@@ -256,7 +256,7 @@ def validate_config_structure(raw: object) -> dict:
         "permission_mode": validate_permission_mode(raw.get("permission_mode", "default")),
         "mcp_servers": validate_mcp_servers(raw.get("mcp_servers")),
         "hooks": validate_hooks(raw.get("hooks")),
-        "enable_fork": validate_bool_field(raw.get("enable_fork", False), "enable_fork"),
+        "enable_fork": validate_bool_field(raw.get("enable_fork", True), "enable_fork"),
         "enable_verification_agent": validate_bool_field(
             raw.get("enable_verification_agent", False), "enable_verification_agent"
         ),

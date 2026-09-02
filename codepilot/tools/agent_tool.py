@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel, Field
@@ -29,6 +30,16 @@ class AgentToolParams(BaseModel):
     run_in_background: bool = False
     name: str | None = None
     isolation: str | None = None
+    plan_mode_required: bool = Field(
+        default=False,
+        description=(
+            "Only meaningful together with team_name. When true, the teammate starts in "
+            "plan mode: it can read and investigate but cannot modify anything until it "
+            "submits a plan and you approve it via SendMessage with "
+            "message_type='plan_approval_response'. Use it for risky or ambiguous tasks "
+            "where a wrong direction would cost a lot of rework."
+        ),
+    )
     team_name: str | None = Field(
         default=None,
         description=(
@@ -49,6 +60,9 @@ PERMISSION_MODE_MAP = {
 
 
 FORK_QUERY_SOURCE = "agent:builtin:fork"
+
+# 省略 subagent_type 且 fork 被关掉时，回退到这个通用 agent
+GENERAL_PURPOSE_AGENT_TYPE = "general-purpose"
 
 TEAMMATE_ADDENDUM = (
     "\n\nIMPORTANT: You are running as an agent in a team.\n"
@@ -97,6 +111,16 @@ class AgentTool(Tool):
         self._team_manager = team_manager
         self.query_source: str = ""
 
+    def _inherited_rule_engine(self) -> Any:
+        """子 Agent 沿用父 Agent 的规则引擎：子 Agent 只换权限模式，
+        父级配置的 allow/deny/ask 规则同样约束它，不能靠派子 Agent 绕开。
+        父级没有权限检查器时退化为空规则集。
+        """
+        from mewcode.permissions import RuleEngine
+
+        parent_checker = getattr(self._parent_agent, "permission_checker", None)
+        return parent_checker.rule_engine if parent_checker else RuleEngine()
+
     async def execute(self, params: BaseModel) -> ToolResult:
         p: AgentToolParams = params  # type: ignore[assignment]
 
@@ -128,23 +152,23 @@ class AgentTool(Tool):
         definition: AgentDef | None = None
         conversation: ConversationManager
 
-        if p.subagent_type:
-            definition = self._agent_loader.get(p.subagent_type)
+        # 省略 subagent_type 时的走向由 enable_fork 决定：开着走 fork（继承父对话），
+        # 关着就当成没指定类型，回退到通用 agent。这里不报错，因为模型只是没填一个
+        # 可选参数，为此中断一次调用不值得，回退到通用 agent 一样能把活干了。
+        effective_type = p.subagent_type
+        if not effective_type and not self._enable_fork:
+            effective_type = GENERAL_PURPOSE_AGENT_TYPE
+
+        if effective_type:
+            definition = self._agent_loader.get(effective_type)
             if definition is None:
                 return ToolResult(
-                    output=f"Unknown agent type: '{p.subagent_type}'. "
+                    output=f"Unknown agent type: '{effective_type}'. "
                     f"Available types: {', '.join(t for t, _ in self._agent_loader.list_agents())}",
                     is_error=True,
                 )
             conversation = ConversationManager()
         else:
-            if not self._enable_fork:
-                return ToolResult(
-                    output="Fork mode is not enabled. "
-                    "Set 'enable_fork: true' in config.yaml to use fork, "
-                    "or specify a subagent_type parameter.",
-                    is_error=True,
-                )
             # fork 子 Agent 不允许再次 fork，防止无限嵌套
             if self.query_source == FORK_QUERY_SOURCE:
                 return ToolResult(
@@ -178,7 +202,7 @@ class AgentTool(Tool):
         client = self._select_llm(p, definition)
 
         # 判断是否后台运行
-        is_fork = p.subagent_type is None
+        is_fork = not effective_type
         is_background = p.run_in_background or definition.background
         if is_fork:
             is_background = True
@@ -186,7 +210,7 @@ class AgentTool(Tool):
         # 构建子 agent 工具注册表
         _base_registry = getattr(self._parent_agent, '_full_registry', None) or self._parent_agent.registry
         if is_fork:
-            # fork 继承父 Agent 的完整工具池（对齐 Claude Code 的 useExactTools），
+            # fork 继承父 Agent 的完整工具池，确保子 Agent 拥有相同的工具能力，
             # AgentTool 实例的 query_source 被标记为 fork 以拦截嵌套
             filtered_registry = clone_registry_for_fork(_base_registry)
         else:
@@ -201,10 +225,12 @@ class AgentTool(Tool):
             PERMISSION_MODE_MAP.get(pm_str, "DEFAULT"),
             PermissionMode.DEFAULT,
         )
+        # 规则引擎沿用父 Agent 那一份：子 Agent 只换权限模式，
+        # 父级配置的 allow/deny/ask 规则同样约束它，不能靠派子 Agent 绕开
         checker = PermissionChecker(
             detector=DangerousCommandDetector(),
             sandbox=PathSandbox(self._parent_agent.work_dir),
-            rule_engine=RuleEngine(),
+            rule_engine=self._inherited_rule_engine(),
             mode=pm_enum,
         )
 
@@ -223,14 +249,6 @@ class AgentTool(Tool):
         sub_agent.parent_id = self._parent_agent.agent_id
         sub_agent.trace_id = self._parent_agent.trace_id or self._parent_agent.agent_id
 
-        # fork 子 agent 继承父 agent 的替换状态，确保共享的 tool_use_id 做出一致的
-        # 决策——这样父子共享的 prompt cache 前缀才能保持字节级一致
-        if p.subagent_type is None:
-            from mewcode.context import clone_replacement_state
-            sub_agent.replacement_state = clone_replacement_state(
-                self._parent_agent.replacement_state
-            )
-
         # 注册追踪节点
         trace_node = self._trace_manager.create(
             agent_type=definition.agent_type,
@@ -239,7 +257,7 @@ class AgentTool(Tool):
         )
         sub_agent.agent_id = trace_node.agent_id
 
-        agent_name = p.name or p.subagent_type or f"agent-{trace_node.agent_id}"
+        agent_name = p.name or effective_type or f"agent-{trace_node.agent_id}"
 
         if is_background:
             if is_fork:
@@ -301,9 +319,14 @@ class AgentTool(Tool):
         from mewcode.teams.models import BackendType, TeammateInfo
         from mewcode.teams.registry import AgentNameRegistry
 
+        # 团队不存在就顺手建一个：coordinator 模式下 TeamCreate 不在白名单里，
+        # 要求 Lead 先建团队再派人，它会卡在第一步。
         team = self._team_manager.get_team(p.team_name)
         if team is None:
-            return ToolResult(output=f"Team '{p.team_name}' not found. Create it first with TeamCreate.", is_error=True)
+            team = self._team_manager.create_team(
+                name=p.team_name,
+                lead_agent_id=getattr(self._parent_agent, "agent_id", "lead"),
+            )
 
         base_name = p.name or p.subagent_type or "worker"
         existing_names = {m.name for m in team.members}
@@ -396,11 +419,14 @@ class AgentTool(Tool):
         # 6. 创建子 agent 并附加队友专属指令
         instructions = (definition.system_prompt or "") + TEAMMATE_ADDENDUM
 
+        # 标了 plan_mode_required 的队友以计划模式启动：只能读不能改，
+        # 写出计划交 lead 审批，通过后才切回正常权限。
+        # 规则引擎沿用父 Agent 那一份，队友在 worktree 里同样受父级规则约束
         checker = PermissionChecker(
             detector=DangerousCommandDetector(),
             sandbox=PathSandbox(wt.path),
-            rule_engine=RuleEngine(),
-            mode=PermissionMode.BYPASS,
+            rule_engine=self._inherited_rule_engine(),
+            mode=PermissionMode.PLAN if p.plan_mode_required else PermissionMode.BYPASS,
         )
 
         sub_agent = AgentClass(
@@ -431,6 +457,7 @@ class AgentTool(Tool):
             worktree_path=wt.path,
             backend_type=backend.value,
             is_active=True,
+            joined_at=int(time.time()),
         )
         self._team_manager.register_member(p.team_name, member)
 
@@ -465,34 +492,42 @@ class AgentTool(Tool):
         agent_id: str, teammate_name: str,
     ) -> ToolResult:
         from mewcode.teams.models import BackendType
+        from mewcode.teams.spawn import build_teammate_cli
 
+        # 外部进程通过邮箱领取初始任务：spawn 前先把任务投进队友邮箱（按队友名字为键），
+        # 新进程启动后第一次空闲轮询就能看到工作。
         mailbox = self._team_manager.get_mailbox(p.team_name)
-        mailbox_dir = str(mailbox._base_dir) if mailbox else ""
+        if mailbox is not None and p.prompt:
+            from mewcode.teams.mailbox import create_message
+            from mewcode.teams.spawn_inprocess import LEAD_NAME
+            mailbox.write(
+                teammate_name,
+                create_message(
+                    from_agent=LEAD_NAME,
+                    text=p.prompt,
+                ),
+            )
+
+        # 构造把本 mewcode 拉起为队友 worker 模式的命令，cd 到该队友的 worktree
+        cli_command = build_teammate_cli(p.team_name, teammate_name, wt.path)
 
         try:
             if backend == BackendType.TMUX:
                 from mewcode.teams.spawn_tmux import spawn_tmux_teammate
                 pane_info = spawn_tmux_teammate(
                     team_name=p.team_name,
-                    teammate_name=teammate_name,
-                    worktree_path=wt.path,
-                    prompt=p.prompt,
-                    agent_type=p.subagent_type or "",
-                    model=p.model or "",
-                    mailbox_dir=mailbox_dir,
+                    member_name=teammate_name,
+                    cli_command=cli_command,
                 )
                 self._team_manager.register_pane_id(agent_id, pane_info.pane_id)
             elif backend == BackendType.ITERM2:
                 from mewcode.teams.spawn_iterm2 import spawn_iterm2_teammate
                 pane_info = spawn_iterm2_teammate(
                     team_name=p.team_name,
-                    teammate_name=teammate_name,
-                    worktree_path=wt.path,
-                    prompt=p.prompt,
-                    agent_type=p.subagent_type or "",
-                    model=p.model or "",
-                    mailbox_dir=mailbox_dir,
+                    member_name=teammate_name,
+                    cli_command=cli_command,
                 )
+                self._team_manager.register_pane_id(agent_id, pane_info.session_id)
         except Exception as e:
             log.warning("Pane spawn failed, falling back to in-process: %s", e)
             return ToolResult(
@@ -599,10 +634,11 @@ class AgentTool(Tool):
             PERMISSION_MODE_MAP.get(pm_str, "DEFAULT"),
             PermissionMode.DEFAULT,
         )
+        # 规则引擎沿用父 Agent 那一份，队友在 worktree 里同样受父级规则约束
         checker = PermissionChecker(
             detector=DangerousCommandDetector(),
             sandbox=PathSandbox(wt.path),
-            rule_engine=RuleEngine(),
+            rule_engine=self._inherited_rule_engine(),
             mode=pm_enum,
         )
 

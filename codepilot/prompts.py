@@ -22,7 +22,7 @@ class PromptSection:
 
 @dataclass
 class EnvironmentContext:
-    """运行环境上下文（对齐 Go 版 EnvironmentContext）。"""
+    """运行环境上下文。"""
     work_dir: str
     os_name: str       # 操作系统名称（如 Linux, Darwin）
     arch: str          # 架构（如 x86_64, arm64）
@@ -50,7 +50,7 @@ class PromptBuilder:
 
 
 # ---------------------------------------------------------------------------
-# prompt 分段（对应 Go 版 sections.go，优先级 0-95）
+# prompt 分段（优先级 0-95）
 # ---------------------------------------------------------------------------
 
 IDENTITY_SECTION = PromptSection(
@@ -167,7 +167,7 @@ In code: default to writing no comments. Never write multi-paragraph docstrings 
 
 
 def detect_environment(work_dir: str) -> EnvironmentContext:
-    """检测当前运行环境，返回 EnvironmentContext（对齐 Go 版 DetectEnvironment）。"""
+    """检测当前运行环境，返回 EnvironmentContext。"""
     shell = os.environ.get("SHELL", "bash")
     is_git = False
     branch = ""
@@ -200,7 +200,7 @@ def detect_environment(work_dir: str) -> EnvironmentContext:
 
 
 def environment_section(work_dir: str, env: EnvironmentContext | None = None) -> PromptSection:
-    """构建环境信息 prompt 段落（对齐 Go 版 EnvironmentSection）。"""
+    """构建环境信息 prompt 段落。"""
     if env is None:
         env = detect_environment(work_dir)
     lines = [
@@ -214,12 +214,11 @@ def environment_section(work_dir: str, env: EnvironmentContext | None = None) ->
         lines.append(f" - Git branch: {env.git_branch}")
     if env.model:
         lines.append(f" - Model: {env.model}")
-    lines.append(f" - Date: {env.date}")
     return PromptSection(name="Environment", priority=70, content="\n".join(lines))
 
 
 # ---------------------------------------------------------------------------
-# Plan 模式提示语（对应 Go 版 plan_mode.go）
+# Plan 模式提示语
 # ---------------------------------------------------------------------------
 
 _PLAN_MODE_FULL_REMINDER = """\
@@ -307,11 +306,9 @@ def build_plan_mode_reminder(
             "using the WriteFile tool."
         )
 
-    if iteration == 1:
-        return _PLAN_MODE_FULL_REMINDER.format(plan_file_info=plan_file_info)
-
-    attachment_index = (iteration - 1) // _REMINDER_INTERVAL
-    if attachment_index % _REMINDER_INTERVAL == 0:
+    # 首轮和之后每隔 _REMINDER_INTERVAL 轮发一次完整提示，中间轮次发精简版：
+    # 完整版每轮重发太费 token，但只发一次模型会逐渐漂移，周期性复述是两者的折中。
+    if (iteration - 1) % _REMINDER_INTERVAL == 0:
         return _PLAN_MODE_FULL_REMINDER.format(plan_file_info=plan_file_info)
 
     return _PLAN_MODE_SPARSE_REMINDER.format(plan_path=plan_path)
@@ -323,17 +320,11 @@ def build_plan_mode_reminder(
 
 def build_system_prompt(
     hook_prompts: list[str] | None = None,
-    coordinator_mode: bool = False,
-    agent_catalog: list[tuple[str, str]] | None = None,
-    custom_instructions: str = "",
-    skill_section: str = "",
-    memory_section: str = "",
     work_dir: str = ".",
 ) -> str:
-    if coordinator_mode:
-        from mewcode.teams.coordinator import get_coordinator_system_prompt
-        return get_coordinator_system_prompt(agent_catalog=agent_catalog)
-
+    # System Prompt 放产品定义和运行环境，这些每轮都要准确、也不该被压缩掉。
+    # 项目指令、自动记忆、Skill 清单跟着项目走，允许随对话被摘要，分别由
+    # inject_long_term_memory 和 inject_environment 注入对话。
     b = PromptBuilder()
     b.add(IDENTITY_SECTION)
     b.add(SYSTEM_SECTION)
@@ -343,19 +334,6 @@ def build_system_prompt(
     b.add(TONE_STYLE_SECTION)
     b.add(TEXT_OUTPUT_SECTION)
     b.add(environment_section(work_dir))
-
-    if custom_instructions:
-        b.add(PromptSection(
-            name="CustomInstructions",
-            priority=80,
-            content=f"# Project Instructions\n\n{custom_instructions}",
-        ))
-
-    if skill_section:
-        b.add(PromptSection(name="Skills", priority=90, content=skill_section))
-
-    if memory_section:
-        b.add(PromptSection(name="Memory", priority=95, content=memory_section))
 
     result = b.build()
 
@@ -371,9 +349,9 @@ def build_environment_context(
     skill_catalog: str = "",
     agent_catalog: str = "",
 ) -> str:
+    # 工作目录和操作系统由 System Prompt 的环境段负责，这里只放它装不下的：
+    # 当前时间每分钟都在变，Skill 和 Agent 清单跟着项目走，放进缓存前缀不划算。
     parts = [
-        f"Current working directory: {work_dir}",
-        f"Operating system: {platform.system()} {platform.release()}",
         f"Current time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
     ]
 
@@ -385,7 +363,7 @@ def build_environment_context(
         parts.append("")
         parts.append(skill_catalog)
 
-    # active_skills 不再注入 env context —— Skill 内容作为普通消息注入一次到对话历史，
+    # Skill 内容作为普通消息注入一次到对话历史，不随每轮重复注入，
     # 随对话自然推远，auto-compact 时会被摘要。
 
     return "\n".join(parts)

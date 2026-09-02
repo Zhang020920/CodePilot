@@ -99,25 +99,12 @@ class TeamCreateTool(Tool):
         except Exception as e:
             return ToolResult(output=f"Failed to create team: {e}", is_error=True)
 
-        coordinator_note = ""
-        from mewcode.teams.coordinator import is_coordinator_mode
-        if is_coordinator_mode(self._enable_coordinator_mode):
-            from mewcode.agents.tool_filter import apply_coordinator_filter
-            self._parent_agent._team_manager = self._team_manager
-            if not self._parent_agent.coordinator_mode:
-                # 只在从"未限制"切换到"限制"时才保存全量注册表快照，
-                # 避免第二个 Team 创建时把已过滤的注册表误当成全量注册表存起来。
-                self._parent_agent._full_registry = self._parent_agent.registry
-                self._parent_agent.registry = apply_coordinator_filter(self._parent_agent.registry)
-                self._parent_agent.coordinator_mode = True
-            coordinator_note = "\nCoordinator Mode activated: tools narrowed to dispatch-only."
-
+        # coordinator 模式由配置在启动时决定，建团队不改变它，这里不碰工具集
         return ToolResult(
             output=(
                 f"Team '{team.name}' created successfully.\n"
                 f"Backend: {backend.value}\n"
                 f"Config: {team.config_path}\n"
                 f"Use Agent tool with team_name='{team.name}' to spawn teammates."
-                f"{coordinator_note}"
             )
         )

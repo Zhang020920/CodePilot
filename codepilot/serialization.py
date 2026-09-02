@@ -39,10 +39,13 @@ def build_anthropic_messages(messages: list[Message]) -> list[dict[str, Any]]:
         elif m.tool_results:
             content = []
             for tr in m.tool_results:
+                # 带结构化 block 的走 block 数组（tool_reference 这类要求
+                # 服务端解析的内容只能这么发），其余照旧发纯文本
+                body: Any = tr.content_blocks if tr.content_blocks else tr.content
                 content.append({
                     "type": "tool_result",
                     "tool_use_id": tr.tool_use_id,
-                    "content": tr.content,
+                    "content": body,
                     "is_error": tr.is_error,
                 })
             result.append({"role": "user", "content": content})

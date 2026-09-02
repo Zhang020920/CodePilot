@@ -48,6 +48,9 @@ ASYNC_AGENT_ALLOWED_TOOLS: frozenset[str] = frozenset({
     "LoadSkill",
     "SyntheticOutput",
     "ToolSearch",
+    # ToolSearch 只负责把 schema 读出来，真正调用要靠 mcp_call，
+    # 两个得成对放行，否则子 Agent 看得见工具却调不动
+    "mcp_call",
     "EnterWorktree",
     "ExitWorktree",
 })
@@ -60,6 +63,10 @@ TEAMMATE_COORDINATION_TOOLS: frozenset[str] = frozenset({
     "SendMessage",
 })
 
+# 队友在协作工具之外额外被挡掉的工具。组建和解散团队由 Lead 负责，队友只管干活
+# 和相互协调，不参与团队成员管理。
+TEAMMATE_DISALLOWED_TOOLS: frozenset[str] = frozenset({"TeamCreate", "TeamDelete"})
+
 IN_PROCESS_TEAMMATE_ALLOWED_TOOLS: frozenset[str] = (
     ASYNC_AGENT_ALLOWED_TOOLS | TEAMMATE_COORDINATION_TOOLS | frozenset({
         "CronCreate",
@@ -68,21 +75,26 @@ IN_PROCESS_TEAMMATE_ALLOWED_TOOLS: frozenset[str] = (
     })
 )
 
+# Coordinator 模式把 Lead 的工具集收窄到纯调度。
+#
+# 划线的标准不是「读」和「写」，而是这个工具会不会把大段内容灌进 Lead 的上下文。
+# Lead 的上下文要装任务分解、队员状态和消息记录，一旦它能直接读文件、跑命令，
+# 模型就会忍不住自己去查，几千行代码进来，真正该留给调度的空间就没了。
+# 所以 ReadFile / Glob / Grep / Bash 都不在这里：需要看代码就派队员去看。
+#
+# 任务分派靠 Agent 的 prompt 写清楚，不靠共享任务表，因此 TaskCreate / TaskGet /
+# TaskList / TaskUpdate 也不给 Lead，它们属于 TEAMMATE_COORDINATION_TOOLS，
+# 是队员之间协调用的。Lead 掌握进度靠队员完成时回传的 <task-notification>。
+#
+# TeamDelete 必须留着：coordinator 模式由 TeamCreate 激活、TeamDelete 解除，
+# 拿掉它 Lead 就再也退不出 coordinator 模式。
+# TeamCreate 不需要在这里，激活之前工具集还没被收窄。
 COORDINATOR_MODE_ALLOWED_TOOLS: frozenset[str] = frozenset({
     "Agent",
     "SendMessage",
-    "TaskCreate",
-    "TaskGet",
-    "TaskList",
-    "TaskUpdate",
     "TaskStop",
     "SyntheticOutput",
-    "TeamCreate",
     "TeamDelete",
-    "ReadFile",
-    "Glob",
-    "Grep",
-    "Bash",
 })
 
 
@@ -163,9 +175,13 @@ def build_teammate_tools(
             if name in IN_PROCESS_TEAMMATE_ALLOWED_TOOLS
         }
     else:
-        filtered = {t.name: t for t in parent_registry.list_tools()}
-        filtered.pop("TeamCreate", None)
-        filtered.pop("TeamDelete", None)
+        # 窗格队友整份继承，再挡掉两类：任何子 Agent 都不该有的，以及团队成员管理工具
+        filtered = {
+            name: tool
+            for name, tool in ((t.name, t) for t in parent_registry.list_tools())
+            if name not in ALL_AGENT_DISALLOWED_TOOLS
+            and name not in TEAMMATE_DISALLOWED_TOOLS
+        }
 
     # 应用 agent 定义中的工具限制
     if definition is not None:
@@ -220,9 +236,11 @@ def clone_registry_for_fork(parent_registry: ToolRegistry) -> ToolRegistry:
 
 
 def apply_coordinator_filter(registry: ToolRegistry) -> ToolRegistry:
+    # MCP 工具同样不放行：抓网页、查数据库这类返回值动辄几千 token，
+    # 灌进 Lead 的上下文和让它自己读文件是一个性质，要用就派队员去用。
     all_tools = {t.name: t for t in registry.list_tools()}
     filtered = ToolRegistry()
     for name, tool in all_tools.items():
-        if _is_mcp_tool(name) or name in COORDINATOR_MODE_ALLOWED_TOOLS:
+        if name in COORDINATOR_MODE_ALLOWED_TOOLS:
             filtered.register(tool)
     return filtered

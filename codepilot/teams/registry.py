@@ -42,7 +42,3 @@ class AgentNameRegistry:
 
     def unregister(self, name: str) -> None:
         self._names.pop(name, None)
-
-
-    def list_all(self) -> dict[str, str]:
-        return dict(self._names)

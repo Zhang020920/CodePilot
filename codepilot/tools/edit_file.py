@@ -11,9 +11,9 @@ from typing import TYPE_CHECKING, Any
 from pydantic import BaseModel, Field
 
 from mewcode.tools.base import Tool, ToolResult
+from mewcode.tools.diff import build_diff
 
 if TYPE_CHECKING:
-    from mewcode.cache import FileCache
     from mewcode.tools.file_state_cache import FileStateCache
 
 
@@ -33,8 +33,7 @@ class EditFile(Tool):
     category = "write"
 
 
-    def __init__(self, file_cache: FileCache | None = None, file_history: Any = None, file_state_cache: FileStateCache | None = None) -> None:
-        self._cache = file_cache
+    def __init__(self, file_history: Any = None, file_state_cache: FileStateCache | None = None) -> None:
         self.file_history = file_history
         self._state_cache = file_state_cache
 
@@ -70,11 +69,16 @@ class EditFile(Tool):
         new_content = content.replace(params.old_string, params.new_string, 1)
         try:
             path.write_text(new_content, encoding="utf-8")
-            if self._cache:
-                self._cache.invalidate(str(path.resolve()))
             if self._state_cache:
                 self._state_cache.update(str(path.resolve()))
         except Exception as e:
             return ToolResult(output=f"Error writing file: {e}", is_error=True)
 
-        return ToolResult(output=f"Successfully edited {params.file_path}")
+        diff = build_diff(content, new_content)
+        addition_word = "addition" if diff.additions == 1 else "additions"
+        removal_word = "removal" if diff.removals == 1 else "removals"
+        summary = (
+            f"Updated {params.file_path} with {diff.additions} {addition_word} "
+            f"and {diff.removals} {removal_word}"
+        )
+        return ToolResult(output=f"{summary}\n{diff.text}")

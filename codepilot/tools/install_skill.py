@@ -41,7 +41,6 @@ class InstallSkillTool(Tool):
     )
     params_model = InstallSkillParams
     category = "write"
-    is_system_tool = True
 
     def __init__(self) -> None:
         self._loader: SkillLoader | None = None

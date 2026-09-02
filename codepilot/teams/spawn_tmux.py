@@ -33,62 +33,27 @@ def _run_tmux(*args: str) -> str:
     return result.stdout.strip()
 
 
-def build_cli_command(
-    team_name: str,
-    teammate_name: str,
-    worktree_path: str,
-    prompt: str,
-    agent_type: str = "",
-    model: str = "",
-    mailbox_dir: str = "",
-) -> str:
-    parts = ["mewcode", "-p"]
-    parts.extend(["--work-dir", worktree_path])
-    if agent_type:
-        parts.extend(["--agent-type", agent_type])
-    if model:
-        parts.extend(["--model", model])
-    env_parts = [
-        f"MEWCODE_TEAM_NAME={team_name}",
-        f"MEWCODE_TEAMMATE_NAME={teammate_name}",
-    ]
-    if mailbox_dir:
-        env_parts.append(f"MEWCODE_MAILBOX_DIR={mailbox_dir}")
-    env_prefix = " ".join(env_parts)
-    cmd = " ".join(parts)
-    full_prompt = prompt.replace("'", "'\\''")
-    return f"{env_prefix} {cmd} '{full_prompt}'"
-
-
 def spawn_tmux_teammate(
     team_name: str,
-    teammate_name: str,
-    worktree_path: str,
-    prompt: str,
-    agent_type: str = "",
-    model: str = "",
-    mailbox_dir: str = "",
+    member_name: str,
+    cli_command: str,
 ) -> TmuxPaneInfo:
-    window_name = f"{team_name}-{teammate_name}"
+    """在新的 tmux 窗口里跑起队友 worker。
 
-    cli_cmd = build_cli_command(
-        team_name=team_name,
-        teammate_name=teammate_name,
-        worktree_path=worktree_path,
-        prompt=prompt,
-        agent_type=agent_type,
-        model=model,
-        mailbox_dir=mailbox_dir,
-    )
+    cli_command 由 build_teammate_cli 产出（cd 到工作目录后 `-m mewcode --teammate`）。
+    用 new-window（而非 split 分屏）为每个队友开一个独立窗口，窗口名为 team-member。
+    """
+    window_name = f"{team_name}-{member_name}"
 
-    # Create a new tmux window (not split) for the teammate, matching Go
-    _run_tmux("new-window", "-d", "-n", window_name, cli_cmd)
+    # -d 表示不自动切到新窗口，队友在后台运行
+    _run_tmux("new-window", "-d", "-n", window_name, cli_command)
 
-    log.info("Spawned tmux teammate %s in window %s", teammate_name, window_name)
+    log.info("Spawned tmux teammate %s in window %s", member_name, window_name)
     return TmuxPaneInfo(pane_id=window_name, session=team_name)
 
 
 def send_keys_to_pane(pane_id: str, keys: str = "") -> None:
+    """向指定 tmux 窗口发送按键（用于唤醒空闲轮询中的队友）。"""
     try:
         _run_tmux("send-keys", "-t", pane_id, keys, "Enter")
     except TmuxSpawnError:
@@ -96,7 +61,13 @@ def send_keys_to_pane(pane_id: str, keys: str = "") -> None:
 
 
 def kill_pane(pane_id: str) -> None:
+    """关闭队友所在的 tmux 窗口。"""
     try:
-        _run_tmux("kill-pane", "-t", pane_id)
+        # 先发 Ctrl-C 让队友主循环干净退出，再关掉窗口
+        _run_tmux("send-keys", "-t", pane_id, "C-c", "")
+    except TmuxSpawnError:
+        pass
+    try:
+        _run_tmux("kill-window", "-t", pane_id)
     except TmuxSpawnError:
         pass

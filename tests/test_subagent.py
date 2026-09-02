@@ -46,7 +46,6 @@ class DummyTool(Tool):
         self.description = f"Dummy {name}"
         self.category = category
         self.is_concurrency_safe = True
-        self.is_system_tool = False
 
     def get_schema(self):
         return {"name": self.name, "description": self.description, "input_schema": {}}
@@ -106,7 +105,7 @@ class TestAgentParser:
             parse_agent_file(f)
 
     def test_parse_any_model_accepted(self, tmp_path: Path):
-        # 不再限制 model 白名单，第三方模型名称由宿主 ModelResolver 校验
+        # 不限制 model 白名单，第三方模型名称由宿主 ModelResolver 校验
         f = tmp_path / "any_model.md"
         f.write_text("---\nname: t\ndescription: t\nmodel: gpt-4\n---\nbody")
         agent_def = parse_agent_file(f)
@@ -159,7 +158,7 @@ class TestAgentParser:
         f.write_text(md)
         agent_def = parse_agent_file(f)
         assert agent_def.model == "inherit"
-        assert agent_def.max_turns == 200  # 对齐 Go 默认值
+        assert agent_def.max_turns == 200  # 未指定时的默认值
         assert agent_def.permission_mode == "default"
         assert agent_def.background is False
         assert agent_def.tools == []
@@ -197,7 +196,7 @@ class TestAgentLoader:
         assert "Plan" in agents
         assert "general-purpose" in agents
         assert agents["Explore"].model == "haiku"
-        assert agents["Explore"].max_turns == 200  # 对齐 Go 默认值
+        assert agents["Explore"].max_turns == 200  # 未指定时的默认值
 
     def test_verification_disabled_by_default(self, tmp_path: Path):
         loader = AgentLoader(str(tmp_path), enable_verification=False)
@@ -350,10 +349,9 @@ class TestToolFilter:
         assert "ReadFile" in names
 
     def test_builtin_no_custom_restrictions(self):
-        # EnterPlanMode 现在已归入 ALL_AGENT_DISALLOWED（与 Go 版本保持一致），
-        # 所以应当用一个只在 CUSTOM 而不在 ALL 中的工具，来验证内置 agent
-        # 会跳过 custom 这一层。由于 Go 版本会把 ALL 克隆进 CUSTOM，
-        # 这里只验证内置 agent 仍然能拿到正常的工具。
+        # EnterPlanMode 现在已归入 ALL_AGENT_DISALLOWED，所以应当用一个只在
+        # CUSTOM 而不在 ALL 中的工具，来验证内置 agent 会跳过 custom 这一层。
+        # ALL 会克隆进 CUSTOM，这里只验证内置 agent 仍然能拿到正常的工具。
         reg = make_registry("ReadFile", "Bash", "Grep")
         definition = AgentDef(
             agent_type="test", when_to_use="test", source="builtin"
@@ -663,10 +661,11 @@ class TestConfig:
             model: claude-3
         """))
         config = load_config(cfg)
-        assert config.enable_fork is False
+        # fork 默认开着，配置里不写就是开
+        assert config.enable_fork is True
         assert config.enable_verification_agent is False
 
-    def test_enable_fork_true(self, tmp_path: Path):
+    def test_enable_fork_can_be_disabled(self, tmp_path: Path):
         from mewcode.config import load_config
         cfg = tmp_path / "config.yaml"
         cfg.write_text(textwrap.dedent("""\
@@ -675,11 +674,12 @@ class TestConfig:
             protocol: anthropic
             base_url: https://api.example.com
             model: claude-3
-        enable_fork: true
+        enable_fork: false
         enable_verification_agent: true
         """))
         config = load_config(cfg)
-        assert config.enable_fork is True
+        # 写 false 必须真的关掉，不能被「非零即覆盖」的合并逻辑吃掉
+        assert config.enable_fork is False
         assert config.enable_verification_agent is True
 
 # =====================================================================
@@ -745,3 +745,49 @@ class TestAgentExtensions:
         agent = Agent(client=client, registry=registry, protocol="anthropic")
         agent.set_agent_catalog("## Agents\n- Explore")
         assert agent._agent_catalog == "## Agents\n- Explore"
+
+
+class TestSubAgentRuleInheritance:
+    """子 Agent 的规则引擎继承（父级 allow/deny/ask 规则同样约束子 Agent）"""
+
+    @staticmethod
+    def _make_tool(parent):
+        from mewcode.tools.agent_tool import AgentTool
+
+        return AgentTool(
+            agent_loader=None,
+            task_manager=None,
+            trace_manager=None,
+            parent_agent=parent,
+        )
+
+    def test_inherits_parent_rule_engine(self, tmp_path: Path):
+        from mewcode.permissions import (
+            DangerousCommandDetector,
+            PathSandbox,
+            PermissionChecker,
+            PermissionMode,
+            RuleEngine,
+        )
+
+        rules = tmp_path / "permissions.yaml"
+        rules.write_text('- rule: "Bash(git *)"\n  effect: deny\n')
+        engine = RuleEngine(project_rules_path=rules)
+        parent = MagicMock()
+        parent.permission_checker = PermissionChecker(
+            detector=DangerousCommandDetector(),
+            sandbox=PathSandbox(str(tmp_path)),
+            rule_engine=engine,
+            mode=PermissionMode.DEFAULT,
+        )
+
+        inherited = self._make_tool(parent)._inherited_rule_engine()
+        assert inherited is engine
+        assert inherited.evaluate("Bash", "git push") == "deny"
+
+    def test_falls_back_when_parent_has_no_checker(self):
+        parent = MagicMock()
+        parent.permission_checker = None
+
+        inherited = self._make_tool(parent)._inherited_rule_engine()
+        assert inherited.evaluate("Bash", "anything") is None

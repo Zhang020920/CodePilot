@@ -50,8 +50,6 @@ class AskUserTool(Tool):
     )
     params_model = AskUserParams
     category: str = "read"
-    is_system_tool = True
-    should_defer = True
 
 
     def __init__(self) -> None:

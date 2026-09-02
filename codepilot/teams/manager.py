@@ -80,7 +80,7 @@ class TeamManager:
         task_store = SharedTaskStore(team_dir / "tasks.json")
         task_store.init_empty()
 
-        mailbox_dir = team_dir / "mailbox"
+        mailbox_dir = team_dir / "inboxes"
         mailbox_dir.mkdir(parents=True, exist_ok=True)
         mailbox = Mailbox(mailbox_dir)
 
@@ -118,7 +118,7 @@ class TeamManager:
         if team_name in self._mailboxes:
             return self._mailboxes[team_name]
         team_dir = resolve_team_dir(team_name)
-        mailbox_dir = team_dir / "mailbox"
+        mailbox_dir = team_dir / "inboxes"
         if mailbox_dir.exists():
             mailbox = Mailbox(mailbox_dir)
             self._mailboxes[team_name] = mailbox
@@ -151,10 +151,7 @@ class TeamManager:
         if mailbox:
             msg = create_message(
                 from_agent=member_name,
-                to_agent=team.lead_agent_id,
-                content=f"Teammate '{member_name}' is now idle (run_to_completion finished).",
-                summary=f"{member_name} idle",
-                message_type="text",
+                text=f"Teammate '{member_name}' is now idle (run_to_completion finished).",
             )
             mailbox.write(team.lead_agent_id, msg)
 
@@ -167,6 +164,44 @@ class TeamManager:
 
     def get_pane_id(self, agent_id: str) -> str | None:
         return self._pane_ids.get(agent_id)
+
+
+    def stop_member(self, name: str) -> tuple[str, bool] | None:
+        """按队员名中止一个在跑的队员，返回 (团队名, 是否真的停下了一个)。
+
+        队员按后端分两条路生出来：in-process 的挂在 _inprocess_handles 上，
+        tmux / iTerm2 的是独立进程，句柄是 _pane_ids 里的窗格号。
+        两条都要覆盖，只认其中一条就会漏掉另一种后端派出去的队员。
+        找不到该队员时返回 None。
+        """
+        for team_name in self.list_teams():
+            team = self.get_team(team_name)
+            if team is None:
+                continue
+            member = team.get_member(name)
+            if member is None:
+                continue
+
+            stopped = False
+
+            handle = self._inprocess_handles.get(member.agent_id)
+            if handle is not None and not handle.done:
+                handle.cancel()
+                self._inprocess_handles.pop(member.agent_id, None)
+                stopped = True
+
+            pane_id = self._pane_ids.get(member.agent_id)
+            if pane_id:
+                self._kill_pane(pane_id, member.backend_type)
+                self._pane_ids.pop(member.agent_id, None)
+                stopped = True
+
+            if stopped:
+                member.is_active = False
+            return team_name, stopped
+
+        return None
+
 
     def delete_team(self, team_name: str) -> None:
         team = self.get_team(team_name)
@@ -235,7 +270,7 @@ class TeamManager:
                 continue
             parts = [f'<team-notification team="{team_name}">']
             for m in msgs:
-                parts.append(f"from={m.from_agent}: {m.content}")
+                parts.append(f"from={m.from_agent}: {m.text}")
             parts.append("</team-notification>")
             notes.append("\n".join(parts))
         return notes
@@ -265,6 +300,9 @@ class TeamManager:
         try:
             if backend_type == BackendType.TMUX.value:
                 from mewcode.teams.spawn_tmux import kill_pane
+                kill_pane(pane_id)
+            elif backend_type == BackendType.ITERM2.value:
+                from mewcode.teams.spawn_iterm2 import kill_pane
                 kill_pane(pane_id)
         except Exception as e:
             log.warning("Failed to kill pane %s: %s", pane_id, e)

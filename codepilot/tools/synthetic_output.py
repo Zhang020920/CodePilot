@@ -26,7 +26,6 @@ class SyntheticOutputTool(Tool):
     params_model = SyntheticOutputParams
     category = "read"
     is_concurrency_safe = True
-    is_system_tool = True
 
 
     def __init__(self, json_schema: dict[str, Any] | None = None) -> None:

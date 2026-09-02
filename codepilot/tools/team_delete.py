@@ -48,16 +48,5 @@ class TeamDeleteTool(Tool):
         except Exception as e:
             return ToolResult(output=f"Failed to delete team: {e}", is_error=True)
 
-        coordinator_note = ""
-        if self._parent_agent and self._parent_agent.coordinator_mode:
-            # 只有在所有 Team 都被删除后才恢复全量工具，避免多 Team 场景下
-            # 删掉其中一个就提前解除限制。
-            if not self._team_manager.list_teams():
-                full_registry = getattr(self._parent_agent, '_full_registry', None)
-                if full_registry is not None:
-                    self._parent_agent.registry = full_registry
-                    self._parent_agent._full_registry = None
-                self._parent_agent.coordinator_mode = False
-                coordinator_note = "\nCoordinator Mode deactivated: full tools restored."
-
-        return ToolResult(output=f"Team '{p.team_name}' deleted successfully.{coordinator_note}")
+        # coordinator 模式由配置在启动时决定，拆团队不改变它，这里不碰工具集
+        return ToolResult(output=f"Team '{p.team_name}' deleted successfully.")

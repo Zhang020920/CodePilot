@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 import os
-import shutil
+import sys
 
 from mewcode.teams.models import BackendType
 
@@ -14,51 +14,52 @@ class BackendDetectionError(Exception):
     pass
 
 
-def _in_tmux_session() -> bool:
-    return bool(os.environ.get("TMUX"))
+def detect_backend_from_env() -> BackendType:
+    """只按环境变量判断后端，抽出来便于单测（不受运行平台影响）。
 
-
-def _in_iterm2() -> bool:
-    return os.environ.get("TERM_PROGRAM") == "iTerm.app"
-
-
-def _it2_available() -> bool:
-    return shutil.which("it2") is not None
-
-
-def _tmux_installed() -> bool:
-    return shutil.which("tmux") is not None
+    tmux 和 iTerm2 会自动给会话内的进程设上 TMUX / ITERM_SESSION_ID 环境变量，
+    用户无需手动配置。只有已经身处这类会话里，才把队友放进独立窗格；
+    否则一律进程内运行。
+    """
+    if os.environ.get("TMUX"):
+        return BackendType.TMUX
+    if os.environ.get("ITERM_SESSION_ID"):
+        return BackendType.ITERM2
+    return BackendType.IN_PROCESS
 
 
 def detect_backend(
     teammate_mode: str = "",
     is_interactive: bool = True,
 ) -> BackendType:
-    """Default to in-process for real-time progress tracking."""
-    return BackendType.IN_PROCESS
+    """选择队友后端。
+
+    优先级：
+      1. 显式要求 in-process，或处于非交互（如 -p）模式 → 进程内。
+      2. Windows 护栏：tmux 窗格 spawn 时用 pwsh 执行 POSIX 命令会失败，
+         Windows 一律进程内。
+      3. 否则按环境变量：已身处 tmux → tmux；已身处 iTerm2 → iterm2；
+         都不是 → 进程内。
+    """
+    if teammate_mode == "in-process" or not is_interactive:
+        return BackendType.IN_PROCESS
+    if sys.platform == "win32":
+        return BackendType.IN_PROCESS
+    return detect_backend_from_env()
 
 
 def detect_pane_backend(
     teammate_mode: str = "",
     is_interactive: bool = True,
 ) -> BackendType:
-    """检测 pane 后端，对齐 Go 的 detectPaneBackend。
+    """检测窗格后端，只在“已身处 tmux / iTerm2 会话”时才启用窗格。
 
-    优先级：tmux（已在 session 内）> iTerm2 > tmux（已安装）> in-process 兜底。
-    当没有任何外部终端复用器可用时，静默回退到 in-process，而不是抛异常。
+    不做“检测到系统装了 tmux 就用窗格”的探测，
+    只有当前进程本身就跑在 tmux / iTerm2 会话里（有对应环境变量）时才用窗格，
+    否则静默回退到进程内，而不是抛异常中断 team 创建流程。
     """
     if teammate_mode == "in-process" or not is_interactive:
         return BackendType.IN_PROCESS
-
-    if _in_tmux_session():
-        return BackendType.TMUX
-
-    if _in_iterm2() and _it2_available():
-        return BackendType.ITERM2
-
-    if _tmux_installed():
-        return BackendType.TMUX
-
-    # 对齐 Go：没有可用的 pane 后端时静默回退到 in-process，
-    # 而不是抛出异常中断 team 创建流程
-    return BackendType.IN_PROCESS
+    if sys.platform == "win32":
+        return BackendType.IN_PROCESS
+    return detect_backend_from_env()
