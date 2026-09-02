@@ -1,10 +1,10 @@
-# MewCode
+# CodePilot
 
-MewCode 是一个面向软件开发场景的终端 AI 编程助手，支持在本地项目中完成代码分析、文件修改、命令执行、问题修复、上下文管理和多工具协同。项目基于 Python 构建，提供统一的 LLM 接入、MCP 工具生态扩展、安全权限控制、工作树隔离以及可选的远程 WebSocket 交互模式，适合日常开发和自动化编程任务。
+CodePilot 是一个面向软件开发场景的终端 AI 编程助手，支持在本地项目中完成代码分析、文件修改、命令执行、问题修复、上下文管理和多工具协同。项目基于 Python 构建，提供统一的 LLM 接入、MCP 工具生态扩展、安全权限控制、工作树隔离以及可选的远程 WebSocket 交互模式，适合日常开发和自动化编程任务。
 
 ## 项目简介
 
-MewCode 的目标是把“对话式编程”变成可落地的工程化能力。它不仅能理解用户任务，还能主动读取代码、调用工具、执行命令、修改文件并持续推进任务，形成一个完整的终端智能开发工作流。
+CodePilot 的目标是把“对话式编程”变成可落地的工程化能力。它不仅能理解用户任务，还能主动读取代码、调用工具、执行命令、修改文件并持续推进任务，形成一个完整的终端智能开发工作流。
 
 项目支持：
 
@@ -18,7 +18,7 @@ MewCode 的目标是把“对话式编程”变成可落地的工程化能力。
 
 ### 1. 多模型统一接入
 
-通过 `.mewcode/config.yaml` 配置不同的 LLM 提供商，统一由同一套 Agent 逻辑调度。支持配置 `base_url`、`api_key`、`model` 和 `thinking`，方便切换不同厂商和不同模型。
+通过 `.codepilot/config.yaml` 配置不同的 LLM 提供商，统一由同一套 Agent 逻辑调度。支持配置 `base_url`、`api_key`、`model` 和 `thinking`，方便切换不同厂商和不同模型。
 
 ### 2. MCP 工具扩展能力
 
@@ -26,7 +26,7 @@ MewCode 的目标是把“对话式编程”变成可落地的工程化能力。
 
 ### 3. 安全执行与权限控制
 
-MewCode 在执行命令和修改文件前会结合权限模式、危险命令检测、路径沙箱和规则引擎进行校验，降低 AI 自动操作本地环境的风险。
+CodePilot 在执行命令和修改文件前会结合权限模式、危险命令检测、路径沙箱和规则引擎进行校验，降低 AI 自动操作本地环境的风险。
 
 ### 4. 面向真实开发流程设计
 
@@ -55,7 +55,7 @@ MewCode 在执行命令和修改文件前会结合权限模式、危险命令检
 ## 核心流程
 
 1. 用户通过 CLI、非交互模式或远程模式发起任务。
-2. 程序加载 `.mewcode/config.yaml`，初始化 LLM 提供商、MCP Server、权限模式、沙箱和工作树配置。
+2. 程序加载 `.codepilot/config.yaml`，初始化 LLM 提供商、MCP Server、权限模式、沙箱和工作树配置。
 3. Agent 根据系统提示词和当前任务构建上下文，并从工具注册中心获取可用能力。
 4. 当模型需要执行操作时，Agent 进行工具调用，包括文件读取、命令执行、任务管理、团队协作或外部 MCP 工具调用。
 5. 权限系统对敏感操作进行检测和拦截，必要时触发人工确认。
@@ -63,7 +63,7 @@ MewCode 在执行命令和修改文件前会结合权限模式、危险命令检
 
 ## 配置说明
 
-在项目根目录下编辑 `.mewcode/config.yaml`，填入你的 LLM 和 MCP 配置。
+在项目根目录下编辑 `.codepilot/config.yaml`，填入你的 LLM 和 MCP 配置。
 
 ```yaml
 providers:
@@ -103,7 +103,7 @@ mcp_servers:
 uv sync
 
 # 运行
-uv run mewcode
+uv run CodePilot
 
 # 测试
 uv run pytest
@@ -113,26 +113,26 @@ uv run pytest
 
 ```bash
 # 指定权限模式启动
-uv run mewcode --mode default
+uv run CodePilot --mode default
 
 # 非交互模式执行一个 prompt
-uv run mewcode -p "帮我分析这个项目的入口"
+uv run CodePilot -p "帮我分析这个项目的入口"
 
 # 以 stream-json 输出结果
-uv run mewcode -p "总结仓库结构" --output-format stream-json
+uv run CodePilot -p "总结仓库结构" --output-format stream-json
 
 # 启动远程模式
-uv run mewcode --remote
+uv run CodePilot --remote
 ```
 
 ## 项目结构
 
 ```text
 .
-├── .mewcode/                # 本地配置目录
+├── .codepilot/                # 本地配置目录
 │   ├── config.yaml.example  # 配置示例
 │   └── ...
-├── mewcode/                 # 核心源码包
+├── codepilot/                 # 核心源码包
 │   ├── __main__.py          # 命令行入口
 │   ├── agent.py             # Agent 主流程
 │   ├── app.py               # 本地 UI / 应用入口
@@ -150,7 +150,7 @@ uv run mewcode --remote
 ├── tests/                   # 测试代码
 ├── pyproject.toml           # 项目与依赖配置
 ├── uv.lock                  # 锁定文件
-└── MEWCODE.md               # 项目说明文档
+
 ```
 
 ## 适合场景
@@ -161,16 +161,4 @@ uv run mewcode --remote
 - 需要工具调用和多轮上下文的开发场景
 - 需要安全权限控制的本地 AI 编程助手场景
 
-## 进一步扩展
 
-如果你计划继续完善项目，可以考虑增加：
-
-- 配置样例与环境变量说明
-- 截图或动图展示运行效果
-- 更多 MCP 工具接入示例
-- 贡献指南和开发规范
-- 发布记录和版本更新说明
-
-## 许可证
-
-如需开源发布，请在仓库中补充对应的许可证文件。
