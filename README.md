@@ -4,13 +4,7 @@ CodePilot 是一个面向代码审查与自动化重构的终端 AI 编程助手
 
 ## Abstract
 
-Existing long-tailed scene recognition methods struggle because purely visual representations are prone to spatial noise and lack high-level semantic abstraction. In this paper, we show that multi-view linguistic signals are essential for distilling critical scene semantics and suppressing visual clutter. Driven by this insight, we propose the **Linguistic-Guided Scene Reasoning (LTSR)** framework.
-
-Specifically, a large vision-language model generates diverse descriptions for each image to capture environmental and functional attributes from complementary perspectives. A frequency-aware embedding module then refines the textual space to build discriminative category-level semantic prototypes. Furthermore, a category-adaptive sparse cross-attention mechanism dynamically queries the **Top-$K$** relevant prototypes, reducing the attention complexity from $\mathcal{O}(C \cdot d^2)$ to $\mathcal{O}(K \cdot d^2)$, where $C$ denotes the number of classes and $d$ is the feature dimension.
-
-Extensive experiments demonstrate that our framework achieves **state-of-the-art performance** on **Places-LT**, **MLRSNet**, and **MITIndoor**, while also showing strong cross-domain transferability on **CIFAR100-LT** and **ImageNet-LT**.
-
-**Code:** [Anonymous Repository](https://anonymous.4open.science/r/LTSR-0AF6/)
+Existing long-tailed scene recognition methods struggle because purely visual representations are prone to spatial noise and lack high-level semantic abstraction. In this paper, we show that multi-view linguistic signals are essential for distilling critical scene semantics and suppressing visual clutter. Driven by this insight, we propose the **Linguistic-Guided Scene Reasoning (LTSR)** framework. Specifically, a large vision-language model generates diverse descriptions for each image to capture environmental and functional attributes from complementary perspectives. A frequency-aware embedding module then refines the textual space to build discriminative category-level semantic prototypes. Furthermore, a category-adaptive sparse cross-attention mechanism dynamically queries the **Top-$K$** relevant prototypes, reducing the attention complexity from $\mathcal{O}(C \cdot d^2)$ to $\mathcal{O}(K \cdot d^2)$, where $C$ denotes the number of classes and $d$ is the feature dimension. Extensive experiments demonstrate that our framework achieves **state-of-the-art performance** on **Places-LT**, **MLRSNet**, and **MITIndoor**, while also showing strong cross-domain transferability on **CIFAR100-LT** and **ImageNet-LT**. **Code:** [Anonymous Repository](https://anonymous.4open.science/r/LTSR-0AF6/)
 
 ## 项目简介
 
