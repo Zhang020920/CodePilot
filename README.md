@@ -2,6 +2,16 @@
 
 CodePilot 是一个面向代码审查与自动化重构的终端 AI 编程助手，支持在本地项目中完成代码分析、文件修改、命令执行、问题修复、上下文管理和多工具协同。项目基于 Python 构建，提供统一的 LLM 接入、MCP 工具生态扩展、安全权限控制、工作树隔离以及可选的远程 WebSocket 交互模式，适合日常开发和自动化编程任务。
 
+## Abstract
+
+Existing long-tailed scene recognition methods struggle because purely visual representations are prone to spatial noise and lack high-level semantic abstraction. In this paper, we show that multi-view linguistic signals are essential for distilling critical scene semantics and suppressing visual clutter. Driven by this insight, we propose the **Linguistic-Guided Scene Reasoning (LTSR)** framework.
+
+Specifically, a large vision-language model generates diverse descriptions for each image to capture environmental and functional attributes from complementary perspectives. A frequency-aware embedding module then refines the textual space to build discriminative category-level semantic prototypes. Furthermore, a category-adaptive sparse cross-attention mechanism dynamically queries the **Top-$K$** relevant prototypes, reducing the attention complexity from $\mathcal{O}(C \cdot d^2)$ to $\mathcal{O}(K \cdot d^2)$, where $C$ denotes the number of classes and $d$ is the feature dimension.
+
+Extensive experiments demonstrate that our framework achieves **state-of-the-art performance** on **Places-LT**, **MLRSNet**, and **MITIndoor**, while also showing strong cross-domain transferability on **CIFAR100-LT** and **ImageNet-LT**.
+
+**Code:** [Anonymous Repository](https://anonymous.4open.science/r/LTSR-0AF6/)
+
 ## 项目简介
 
 CodePilot 的目标是把“对话式编程”变成可落地的工程化能力。它不仅能理解用户任务，还能主动读取代码、调用工具、执行命令、修改文件并持续推进任务，形成一个完整的终端智能开发工作流。
